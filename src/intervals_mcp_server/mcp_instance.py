@@ -14,4 +14,6 @@ mcp: FastMCP = FastMCP(
     "intervals-icu",
     lifespan=setup_api_client,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    stateless_http=True,
+    json_response=True,
 )  # pylint: disable=invalid-name
