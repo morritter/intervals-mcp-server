@@ -88,6 +88,27 @@ class CoachConfig:  # pylint: disable=too-many-instance-attributes
     sleep_recent_nights: int = 3
     sleep_short_min_nights: int = 2
 
+    # Intensity: 7-zone -> 3-zone mapping per zone basis (index 0 = Z1 ... 6 = Z7).
+    # Power (Coggan zones): Z4 = 91-105 % FTP spans LT2 and counts as high
+    # (Treff et al. 2019 / Section 11). HR (LTHR-based zones): Z4 = 94-99 % LTHR is
+    # still below LT2 and counts as moderate.
+    power_zone_map: tuple[int, ...] = (1, 1, 2, 3, 3, 3, 3)
+    hr_zone_map: tuple[int, ...] = (1, 1, 2, 2, 3, 3, 3)
+    pi_z2_substitute: float = 0.01
+    pi_z3_min: float = 0.01
+    pi_polarized_min: float = 2.0
+    # Hard-day ladders: (lowest zone, minimum seconds at or above that zone).
+    # Power per Seiler/Foster; HR is coarser and lags, so only sustained work
+    # above LT2 counts (Section 11).
+    hard_day_power_ladder: tuple[tuple[int, int], ...] = (
+        (3, 1800),
+        (4, 600),
+        (5, 300),
+        (6, 120),
+        (7, 60),
+    )
+    hard_day_hr_ladder: tuple[tuple[int, int], ...] = ((4, 600), (5, 300))
+
     # Top sessions
     top_n: int = 5
 
@@ -355,9 +376,9 @@ def weekly_volume(
     """Per ISO week (Mon-Sun) and sport family: hours, load, sessions, km.
 
     Only days inside the report window count, so the first/last week can be partial
-    (``days`` < 7). Also returns rest days (daily load 0) and the week's Foster
-    monotony, which is only reported for weeks with enough days and active days
-    (short weeks produce meaningless values).
+    (``days`` < 7). Also returns rest days (daily load 0), hard days (see
+    :func:`is_hard_day`) and the week's Foster monotony, which is only reported for
+    weeks with enough days and active days (short weeks produce meaningless values).
     """
     window = days_back(end, days)
     by_day: dict[date, list[Activity]] = defaultdict(list)
@@ -376,7 +397,10 @@ def weekly_volume(
             lambda: {"secs": 0.0, "load": 0.0, "n": 0.0, "meters": 0.0}
         )
         daily = []
+        hard_days = 0
         for day in week_days:
+            if is_hard_day(by_day.get(day, []), config):
+                hard_days += 1
             day_load = 0.0
             for activity in by_day.get(day, []):
                 totals = sports[sport_family(activity.get("type"))]
@@ -418,6 +442,7 @@ def weekly_volume(
                     "n": int(sum(t["n"] for t in sports.values())),
                 },
                 "rest_days": sum(1 for load in daily if load == 0),
+                "hard_days": hard_days,
                 "monotony": _r(week_monotony, 2),
             }
         )
@@ -561,3 +586,225 @@ def sleep_summary(
         ],
         "n": len(window),
     }
+
+
+# ---------------------------------------------------------------------------
+# Intensity distribution
+# ---------------------------------------------------------------------------
+
+ZONE_COUNT = 7
+
+
+def _power_zone_secs(activity: Activity) -> list[float] | None:
+    """Seconds in power zones Z1..Z7 from ``icu_zone_times``.
+
+    Only the ids Z1..Z7 are used; the extra sweet-spot bucket (id ``SS``) overlaps
+    Z3/Z4 and is ignored so time is not counted twice.
+    """
+    zones = activity.get("icu_zone_times")
+    if not isinstance(zones, list):
+        return None
+    secs = [0.0] * ZONE_COUNT
+    for zone in zones:
+        if not isinstance(zone, dict) or not isinstance(zone.get("id"), str):
+            continue
+        zone_id = zone["id"].strip().upper()
+        if len(zone_id) == 2 and zone_id[0] == "Z" and zone_id[1] in "1234567":
+            secs[int(zone_id[1]) - 1] += max(_num(zone.get("secs")) or 0.0, 0.0)
+    return secs if sum(secs) > 0 else None
+
+
+def _hr_zone_secs(activity: Activity) -> list[float] | None:
+    """Seconds in HR zones Z1..Z7 from the ``icu_hr_zone_times`` array (index = zone)."""
+    zones = activity.get("icu_hr_zone_times")
+    if not isinstance(zones, list):
+        return None
+    secs = [0.0] * ZONE_COUNT
+    for index, value in enumerate(zones[:ZONE_COUNT]):
+        secs[index] = max(_num(value) or 0.0, 0.0)
+    return secs if sum(secs) > 0 else None
+
+
+def activity_zones(activity: Activity) -> tuple[list[float] | None, str | None]:
+    """Zone seconds (Z1..Z7) and their basis (``power`` or ``hr``) for one activity.
+
+    Cycling uses power zones with HR as fallback; every other sport uses HR zones
+    with power as fallback. Returns (None, None) without any zone data.
+    """
+    power = _power_zone_secs(activity)
+    heart_rate = _hr_zone_secs(activity)
+    candidates = [(power, "power"), (heart_rate, "hr")]
+    if sport_family(activity.get("type")) != RAD:
+        candidates.reverse()
+    for secs, basis in candidates:
+        if secs is not None:
+            return secs, basis
+    return None, None
+
+
+def three_zone_seconds(
+    secs: list[float], basis: str, config: CoachConfig = DEFAULT_CONFIG
+) -> list[float]:
+    """Collapse Z1..Z7 seconds into the 3-zone model with the basis-specific mapping."""
+    mapping = config.power_zone_map if basis == "power" else config.hr_zone_map
+    result = [0.0, 0.0, 0.0]
+    for index, value in enumerate(secs):
+        result[mapping[index] - 1] += value
+    return result
+
+
+def polarization_index(
+    z1: float, z2: float, z3: float, config: CoachConfig = DEFAULT_CONFIG
+) -> tuple[float | None, str | None]:
+    """Polarization index after Treff et al. (2019), Front Physiol 10:707.
+
+    PI = log10((Z1 / Z2) x Z3 x 100) with Z1..Z3 as fractions of total time.
+    Edge cases (returned as a note):
+
+    * no zone time at all -> (None, ``no_zone_data``)
+    * Z3 < ``pi_z3_min`` (1 %) -> (None, ``z3_zero``): the logarithm is undefined
+      for Z3 = 0 and such a distribution is by definition not polarized
+    * Z1 = 0 -> (None, ``z1_zero``) for the same reason
+    * Z2 = 0 -> Z2 is replaced by ``pi_z2_substitute`` (0.01) as proposed by Treff
+      et al., note ``z2_substituted``
+
+    The index is returned for any distribution where it is defined; whether the
+    structure is actually polarized is decided in :func:`classify_tid`.
+    """
+    if z1 + z2 + z3 <= 0:
+        return None, "no_zone_data"
+    if z3 < config.pi_z3_min:
+        return None, "z3_zero"
+    if z1 <= 0:
+        return None, "z1_zero"
+    note = None
+    if z2 <= 0:
+        z2 = config.pi_z2_substitute
+        note = "z2_substituted"
+    return math.log10(z1 / z2 * z3 * 100), note
+
+
+def classify_tid(
+    z1: float, z2: float, z3: float, pi: float | None, config: CoachConfig = DEFAULT_CONFIG
+) -> str:
+    """Training intensity distribution class (Section 11 priority order).
+
+    1. Base: Z3 below 1 % and Z1 largest
+    2. Polarized: Z1 > Z3 > Z2 and PI > 2.0
+    3. Pyramidal: Z1 > Z2 > Z3
+    4. Threshold: Z2 largest
+    5. HIT: Z3 largest
+    Anything else (e.g. Z1 > Z3 > Z2 with PI <= 2.0) is reported as Pyramidal.
+    """
+    if z3 < config.pi_z3_min and z1 >= z2:
+        return "Base"
+    if z1 > z3 > z2 and pi is not None and pi > config.pi_polarized_min:
+        return "Polarized"
+    if z1 > z2 > z3:
+        return "Pyramidal"
+    if z2 >= z1 and z2 >= z3:
+        return "Threshold"
+    if z3 >= z1 and z3 >= z2:
+        return "HIT"
+    return "Pyramidal"
+
+
+def intensity_distribution(
+    activities: list[Activity], config: CoachConfig = DEFAULT_CONFIG, family: str | None = None
+) -> dict[str, Any]:
+    """3-zone distribution, polarization index and TID class over the given activities.
+
+    Power and HR zone times are mapped separately (each with its own mapping) and
+    then summed; ``basis_pct`` shows how much of the time came from each basis.
+    """
+    totals = [0.0, 0.0, 0.0]
+    by_basis = {"power": 0.0, "hr": 0.0}
+    for activity in activities:
+        if family is not None and sport_family(activity.get("type")) != family:
+            continue
+        secs, basis = activity_zones(activity)
+        if secs is None or basis is None:
+            continue
+        collapsed = three_zone_seconds(secs, basis, config)
+        for index in range(3):
+            totals[index] += collapsed[index]
+        by_basis[basis] += sum(collapsed)
+
+    total = sum(totals)
+    if total <= 0:
+        return {"pct": None, "h": 0, "pi": None, "pi_note": "no_zone_data", "cls": None}
+    z1, z2, z3 = (value / total for value in totals)
+    pi, note = polarization_index(z1, z2, z3, config)
+    result: dict[str, Any] = {
+        "pct": [_r(z1 * 100, 1), _r(z2 * 100, 1), _r(z3 * 100, 1)],
+        "h": _r(total / 3600, 1),
+        "pi": _r(pi, 2),
+        "cls": classify_tid(z1, z2, z3, pi, config),
+        "basis_pct": {basis: _r(secs / total * 100, 0) for basis, secs in by_basis.items()},
+    }
+    if note is not None:
+        result["pi_note"] = note
+    return result
+
+
+def tid_drift(
+    activities: list[Activity], end: date, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """Compare the 7-day with the 28-day distribution (all sports).
+
+    ``acute_depolarization``: PI dropped below the polarized threshold in the last
+    7 days while the 28-day PI is above it; ``shifting``: the class changed;
+    ``consistent``: same class. None when either window lacks zone data.
+    """
+    acute = intensity_distribution(
+        activities_between(activities, end - timedelta(days=config.acute_days - 1), end), config
+    )
+    chronic = intensity_distribution(
+        activities_between(activities, end - timedelta(days=config.chronic_days - 1), end), config
+    )
+    cls_acute, cls_chronic = acute["cls"], chronic["cls"]
+    pi_acute, pi_chronic = acute["pi"], chronic["pi"]
+    drift = None
+    if cls_acute is not None and cls_chronic is not None:
+        if (
+            pi_acute is not None
+            and pi_chronic is not None
+            and pi_acute < config.pi_polarized_min <= pi_chronic
+        ):
+            drift = "acute_depolarization"
+        elif cls_acute != cls_chronic:
+            drift = "shifting"
+        else:
+            drift = "consistent"
+    return {
+        "cls_7d": cls_acute,
+        "cls_28d": cls_chronic,
+        "pi_7d": pi_acute,
+        "pi_28d": pi_chronic,
+        "drift": drift,
+    }
+
+
+def is_hard_day(day_activities: list[Activity], config: CoachConfig = DEFAULT_CONFIG) -> bool | None:
+    """Whether a day counts as hard, from the day's summed zone times.
+
+    Power and HR zone times are accumulated separately. A day is hard if any rung
+    of the power ladder or the HR ladder is reached (time at or above a zone).
+    Returns None when no activity of the day has zone data.
+    """
+    by_basis: dict[str, list[float]] = {}
+    for activity in day_activities:
+        secs, basis = activity_zones(activity)
+        if secs is None or basis is None:
+            continue
+        accumulated = by_basis.setdefault(basis, [0.0] * ZONE_COUNT)
+        for index, value in enumerate(secs):
+            accumulated[index] += value
+    if not by_basis:
+        return None
+    ladders = {"power": config.hard_day_power_ladder, "hr": config.hard_day_hr_ladder}
+    for basis, secs in by_basis.items():
+        for zone, min_secs in ladders[basis]:
+            if sum(secs[zone - 1 :]) >= min_secs:
+                return True
+    return False

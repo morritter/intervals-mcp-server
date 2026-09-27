@@ -8,7 +8,7 @@ from datetime import date
 import pytest
 
 from intervals_mcp_server import coach_metrics as cm
-from tests.coach_fixtures import END, activity, days_before, wellness
+from tests.coach_fixtures import END, activity, days_before, power_zones, wellness
 
 
 # ---------------------------------------------------------------------------
@@ -298,3 +298,140 @@ def test_sleep_summary_without_data():
     assert result["avg_h"] is None
     assert result["recent_h"] == [None, None, None]
     assert result["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Intensity
+# ---------------------------------------------------------------------------
+
+
+def test_power_zones_ignore_sweet_spot_bucket():
+    ride = activity(END, zones=power_zones(100, 200, 300, 400, 0, 0, 0, sweet_spot=500))
+    secs, basis = cm.activity_zones(ride)
+    assert basis == "power"
+    assert secs == [100, 200, 300, 400, 0, 0, 0]
+
+
+def test_ride_without_power_falls_back_to_hr():
+    ride = activity(END, zones=None, hr_zones=[600, 1200, 300, 0, 0])
+    secs, basis = cm.activity_zones(ride)
+    assert basis == "hr"
+    assert secs == [600, 1200, 300, 0, 0, 0, 0]
+
+
+def test_run_prefers_hr_and_falls_back_to_power():
+    run = activity(END, "Run", zones=power_zones(100, 100, 0, 0, 0, 0, 0), hr_zones=[10, 20, 30, 40, 50, 60, 70])
+    assert cm.activity_zones(run) == ([10, 20, 30, 40, 50, 60, 70], "hr")
+    run_power_only = activity(END, "Run", zones=power_zones(100, 100, 0, 0, 0, 0, 0), hr_zones=None)
+    assert cm.activity_zones(run_power_only)[1] == "power"
+
+
+def test_activity_without_hr_or_power_has_no_zones():
+    assert cm.activity_zones(activity(END, "WeightTraining", zones=None, hr_zones=None)) == (None, None)
+    assert cm.activity_zones(activity(END, zones=[], hr_zones=[0, 0, 0])) == (None, None)
+
+
+def test_three_zone_mapping_differs_per_basis():
+    secs = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+    assert cm.three_zone_seconds(secs, "power") == [30.0, 30.0, 220.0]
+    assert cm.three_zone_seconds(secs, "hr") == [30.0, 70.0, 180.0]
+    custom = cm.CoachConfig(power_zone_map=(1, 1, 2, 2, 3, 3, 3))
+    assert cm.three_zone_seconds(secs, "power", custom) == [30.0, 70.0, 180.0]
+
+
+def test_polarization_index_regular():
+    pi, note = cm.polarization_index(0.8, 0.05, 0.15)
+    assert pi == pytest.approx(math.log10(0.8 / 0.05 * 0.15 * 100))
+    assert note is None
+
+
+def test_polarization_index_edge_cases():
+    pi, note = cm.polarization_index(0.85, 0.0, 0.15)
+    assert pi == pytest.approx(math.log10(0.85 / 0.01 * 0.15 * 100))
+    assert note == "z2_substituted"
+    assert cm.polarization_index(0.9, 0.1, 0.0) == (None, "z3_zero")
+    assert cm.polarization_index(0.0, 0.0, 0.0) == (None, "no_zone_data")
+    assert cm.polarization_index(0.0, 0.5, 0.5) == (None, "z1_zero")
+
+
+@pytest.mark.parametrize(
+    ("fractions", "expected"),
+    [
+        ((0.95, 0.05, 0.0), "Base"),
+        ((0.8, 0.05, 0.15), "Polarized"),
+        ((0.75, 0.2, 0.05), "Pyramidal"),
+        ((0.5, 0.2, 0.3), "Pyramidal"),  # polarized shape but PI <= 2
+        ((0.3, 0.5, 0.2), "Threshold"),
+        ((0.3, 0.2, 0.5), "HIT"),
+    ],
+)
+def test_classify_tid(fractions, expected):
+    pi, _ = cm.polarization_index(*fractions)
+    assert cm.classify_tid(*fractions, pi) == expected
+
+
+def test_intensity_distribution_mixes_bases_and_filters_family():
+    acts = [
+        activity(END, "Ride", zones=power_zones(3600, 3600, 0, 0, 720, 0, 0)),
+        activity(END, "Run", zones=None, hr_zones=[1800, 1800, 0, 360, 0]),
+        activity(END, "WeightTraining", zones=None, hr_zones=None),
+    ]
+    result = cm.intensity_distribution(acts)
+    total = 7200 + 720 + 3600 + 360
+    assert result["pct"] == [round(10800 / total * 100, 1), round(360 / total * 100, 1), round(720 / total * 100, 1)]
+    assert result["basis_pct"] == {"power": round(7920 / total * 100), "hr": round(3960 / total * 100)}
+    assert result["h"] == round(total / 3600, 1)
+    rad = cm.intensity_distribution(acts, family=cm.RAD)
+    assert rad["pct"] == [round(7200 / 7920 * 100, 1), 0.0, round(720 / 7920 * 100, 1)]
+    assert rad["pi_note"] == "z2_substituted"
+    assert rad["cls"] == "Polarized"
+
+
+def test_intensity_distribution_without_zone_data():
+    result = cm.intensity_distribution([activity(END, zones=None, hr_zones=None)])
+    assert result["pct"] is None
+    assert result["pi_note"] == "no_zone_data"
+    assert result["cls"] is None
+
+
+def test_tid_drift_acute_depolarization():
+    polarized = power_zones(7000, 200, 0, 800, 0, 0, 0)
+    threshold = power_zones(1000, 1000, 3000, 200, 0, 0, 0)
+    acts = [activity(days_before(END, offset), zones=polarized) for offset in range(7, 28)]
+    acts += [activity(days_before(END, offset), zones=threshold) for offset in range(3)]
+    result = cm.tid_drift(acts, END)
+    assert result["cls_28d"] == "Polarized"
+    assert result["cls_7d"] == "Threshold"
+    assert result["drift"] == "acute_depolarization"
+
+
+def test_tid_drift_without_data():
+    assert cm.tid_drift([], END)["drift"] is None
+
+
+def test_hard_day_ladders():
+    easy = activity(END, zones=power_zones(3600, 3600, 1200, 300, 0, 0, 0))
+    assert cm.is_hard_day([easy]) is False
+    tempo = activity(END, zones=power_zones(3600, 0, 1800, 0, 0, 0, 0))
+    assert cm.is_hard_day([tempo]) is True
+    sprints = activity(END, zones=power_zones(3600, 0, 0, 0, 0, 0, 60))
+    assert cm.is_hard_day([sprints]) is True
+    hr_z3_only = activity(END, "Run", zones=None, hr_zones=[0, 0, 3600, 0, 0])
+    assert cm.is_hard_day([hr_z3_only]) is False  # HR ladder ignores Z3
+    hr_threshold = activity(END, "Run", zones=None, hr_zones=[0, 0, 0, 400, 200])
+    assert cm.is_hard_day([hr_threshold]) is True
+    assert cm.is_hard_day([activity(END, zones=None, hr_zones=None)]) is None
+    assert cm.is_hard_day([]) is None
+
+
+def test_hard_day_sums_activities_of_the_day():
+    half = activity(END, zones=power_zones(0, 0, 0, 300, 0, 0, 0))
+    assert cm.is_hard_day([half]) is False
+    assert cm.is_hard_day([half, half]) is True
+
+
+def test_weekly_volume_counts_hard_days():
+    hard = power_zones(1800, 1800, 0, 900, 0, 0, 0)
+    acts = [activity(days_before(END, offset), zones=hard) for offset in (0, 2)]
+    acts.append(activity(days_before(END, 4), zones=power_zones(3600, 0, 0, 0, 0, 0, 0)))
+    assert cm.weekly_volume(acts, END, 7)[0]["hard_days"] == 2
