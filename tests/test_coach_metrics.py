@@ -3,12 +3,16 @@ Unit tests for the pure coach_metrics module (no network).
 """
 
 import math
+import pathlib
+import sys
 from datetime import date
 
 import pytest
 
-from intervals_mcp_server import coach_metrics as cm
-from tests.coach_fixtures import END, activity, days_before, power_zones, wellness
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+from intervals_mcp_server import coach_metrics as cm  # pylint: disable=wrong-import-position  # noqa: E402
+from tests.coach_fixtures import END, activity, days_before, power_zones, wellness  # pylint: disable=wrong-import-position  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -435,3 +439,108 @@ def test_weekly_volume_counts_hard_days():
     acts = [activity(days_before(END, offset), zones=hard) for offset in (0, 2)]
     acts.append(activity(days_before(END, 4), zones=power_zones(3600, 0, 0, 0, 0, 0, 0)))
     assert cm.weekly_volume(acts, END, 7)[0]["hard_days"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Capability
+# ---------------------------------------------------------------------------
+
+
+def _steady_ride(day, decoupling=3.0, **kwargs):
+    params = {"moving": 7200, "elapsed": 7400, "vi": 1.05, "temp": 18.0, "decoupling": decoupling}
+    params.update(kwargs)
+    return activity(day, "Ride", **params)
+
+
+def test_durability_exclusion_reasons():
+    acts = [
+        _steady_ride(END, moving=3000),  # short
+        _steady_ride(END, elapsed=9000),  # pauses
+        _steady_ride(END, temp=28.0),  # heat
+        _steady_ride(END, vi=None),  # no_power
+        _steady_ride(END, vi=1.2),  # vi
+        _steady_ride(END, decoupling=None),  # no_decoupling
+        activity(END, "WeightTraining", moving=3600),  # not considered at all
+        activity(END, "GravelRide", moving=7200),  # not a durability type
+    ]
+    result = cm.durability(acts, END, 28)
+    assert result["excluded"] == 6
+    assert result["reasons"] == {
+        "heat": 1,
+        "no_decoupling": 1,
+        "no_power": 1,
+        "pauses": 1,
+        "short": 1,
+        "vi": 1,
+    }
+    assert result[cm.RAD]["median"] is None
+    assert result[cm.RAD]["n"] == 0
+
+
+def test_durability_run_without_power_and_indoor_without_temp_pass():
+    acts = [
+        activity(END, "Run", moving=4000, vi=None, temp=15.0, decoupling=2.5),
+        activity(END, "VirtualRide", moving=4000, vi=1.02, temp=None, decoupling=1.5),
+    ]
+    result = cm.durability(acts, END, 28)
+    assert result[cm.LAUF]["median"] == 2.5
+    assert result[cm.RAD]["median"] == 1.5
+    assert result["excluded"] == 0
+
+
+def test_durability_median_high_drift_and_trend():
+    acts = [_steady_ride(days_before(END, offset), decoupling=2.0) for offset in (10, 12, 14, 20)]
+    acts += [_steady_ride(days_before(END, offset), decoupling=6.5) for offset in (0, 2, 4)]
+    rad = cm.durability(acts, END, 28)[cm.RAD]
+    assert rad["n"] == 7
+    assert rad["median"] == 2.0
+    assert rad["high"] == 3
+    assert rad["high_7d"] == 3
+    assert rad["trend"] == "declining"
+
+
+def test_durability_negative_decoupling_kept():
+    rad = cm.durability([_steady_ride(END, decoupling=-2.0)], END, 28)[cm.RAD]
+    assert rad["median"] == -2.0
+    assert rad["trend"] is None  # needs 2 sessions per window
+
+
+def test_efficiency_factor_trend():
+    acts = [activity(days_before(END, offset), vi=1.02, ef=1.80, moving=3600) for offset in (10, 15, 20)]
+    acts += [activity(days_before(END, offset), vi=1.02, ef=1.90, moving=3600) for offset in (1, 3)]
+    acts.append(activity(END, vi=1.2, ef=2.5))  # not steady
+    acts.append(activity(END, vi=1.0, ef=2.5, moving=600))  # too short
+    acts.append(activity(END, "Run", vi=1.0, ef=2.5))  # not cycling
+    result = cm.efficiency_factor(acts, END)
+    assert result["n_7d"] == 2
+    assert result["n_28d"] == 5
+    assert result["ef_7d"] == 1.9
+    assert result["ef_28d"] == round((3 * 1.8 + 2 * 1.9) / 5, 2)
+    assert result["trend"] == "improving"
+
+
+def test_efficiency_factor_insufficient():
+    result = cm.efficiency_factor([activity(END, vi=1.0, ef=1.8)], END)
+    assert result["ef_7d"] is None
+    assert result["trend"] is None
+
+
+def test_eftp_trend_with_gaps():
+    records = [
+        wellness(END, eftp=352.0),
+        wellness(days_before(END, 30), eftp=340.0),  # within 3 days of the 28-day target
+        wellness(days_before(END, 56), eftp=None),
+        wellness(days_before(END, 70), eftp=320.0),  # outside tolerance
+    ]
+    result = cm.eftp_trend(cm.wellness_by_day(records), END)
+    assert result == {
+        "now": 352,
+        "d28": 340,
+        "pct_28": round((352 / 340 - 1) * 100, 1),
+        "d56": None,
+        "pct_56": None,
+    }
+
+
+def test_eftp_trend_without_data():
+    assert cm.eftp_trend({}, END)["now"] is None

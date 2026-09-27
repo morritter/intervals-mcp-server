@@ -109,6 +109,29 @@ class CoachConfig:  # pylint: disable=too-many-instance-attributes
     )
     hard_day_hr_ladder: tuple[tuple[int, int], ...] = ((4, 600), (5, 300))
 
+    # Durability (aerobic decoupling) quality filter
+    durability_ride_types: tuple[str, ...] = ("Ride", "VirtualRide")
+    durability_run_types: tuple[str, ...] = ("Run",)
+    durability_min_moving_s: int = 3600
+    durability_max_vi: float = 1.10
+    durability_min_moving_ratio: float = 0.9
+    durability_max_temp_c: float = 25.0
+    durability_high_drift_pct: float = 5.0
+    durability_high_drift_count_7d: int = 3
+    durability_trend_band_pct: float = 1.0
+    durability_min_sessions_trend: int = 2
+
+    # Efficiency factor (NP / avg HR), steady cycling only
+    ef_types: tuple[str, ...] = ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide")
+    ef_max_vi: float = 1.05
+    ef_min_moving_s: int = 1200
+    ef_min_sessions: int = 2
+    ef_trend_band: float = 0.03
+
+    # eFTP trend from wellness.sportInfo
+    eftp_lookback_days: tuple[int, ...] = (28, 56)
+    eftp_tolerance_days: int = 3
+
     # Top sessions
     top_n: int = 5
 
@@ -808,3 +831,194 @@ def is_hard_day(day_activities: list[Activity], config: CoachConfig = DEFAULT_CO
             if sum(secs[zone - 1 :]) >= min_secs:
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Capability: durability, efficiency factor, eFTP
+# ---------------------------------------------------------------------------
+
+
+def _durability_exclusion(activity: Activity, family: str, config: CoachConfig) -> str | None:
+    """First failed quality criterion for a decoupling value, or None if it qualifies.
+
+    Reasons: ``short`` (< 60 min moving), ``pauses`` (moving/elapsed < 0.9),
+    ``heat`` (avg temperature > 25 degC; a missing temperature, e.g. indoors, passes),
+    ``no_power`` (ride without VI), ``vi`` (VI > 1.10; runs without power skip this
+    check), ``no_decoupling`` (value missing).
+    """
+    moving = _num(activity.get("moving_time")) or 0.0
+    if moving < config.durability_min_moving_s:
+        return "short"
+    elapsed = _num(activity.get("elapsed_time"))
+    if elapsed is not None and elapsed > 0 and moving / elapsed < config.durability_min_moving_ratio:
+        return "pauses"
+    temp = _num(activity.get("average_temp"))
+    if temp is not None and temp > config.durability_max_temp_c:
+        return "heat"
+    vi = _num(activity.get("icu_variability_index"))
+    if vi is None or vi <= 0:
+        if family == RAD:
+            return "no_power"
+    elif vi > config.durability_max_vi:
+        return "vi"
+    if _num(activity.get("decoupling")) is None:
+        return "no_decoupling"
+    return None
+
+
+def durability(
+    activities: list[Activity], end: date, days: int, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """Aerobic decoupling (Pa:HR / Pace:HR drift, %) of steady long sessions.
+
+    Only rides (Ride, VirtualRide) and runs that pass the quality filter count (see
+    :func:`_durability_exclusion`). Per sport: median over the report window, number
+    of values, number above ``durability_high_drift_pct`` (in the window and in the
+    last 7 days) and the trend of the 7-day median vs. the window median
+    (+/- ``durability_trend_band_pct`` = stable). Negative values (HR drifting down)
+    are kept. Excluded sessions are counted per reason.
+    """
+    window_start = end - timedelta(days=days - 1)
+    acute_start = end - timedelta(days=config.acute_days - 1)
+    reasons: dict[str, int] = defaultdict(int)
+    values: dict[str, list[tuple[date, float]]] = {RAD: [], LAUF: []}
+    for activity in activities_between(activities, window_start, end):
+        activity_type = activity.get("type")
+        if activity_type in config.durability_ride_types:
+            family = RAD
+        elif activity_type in config.durability_run_types:
+            family = LAUF
+        else:
+            continue
+        reason = _durability_exclusion(activity, family, config)
+        if reason is not None:
+            reasons[reason] += 1
+            continue
+        day = activity_day(activity)
+        decoupling = _num(activity.get("decoupling"))
+        if day is not None and decoupling is not None:
+            values[family].append((day, decoupling))
+
+    result: dict[str, Any] = {}
+    for family, entries in values.items():
+        window_values = [value for _, value in entries]
+        acute_values = [value for day, value in entries if day >= acute_start]
+        median = statistics.median(window_values) if window_values else None
+        trend = None
+        if (
+            median is not None
+            and days > config.acute_days
+            and len(acute_values) >= config.durability_min_sessions_trend
+            and len(window_values) >= config.durability_min_sessions_trend
+        ):
+            delta = statistics.median(acute_values) - median
+            if delta < -config.durability_trend_band_pct:
+                trend = "improving"
+            elif delta > config.durability_trend_band_pct:
+                trend = "declining"
+            else:
+                trend = "stable"
+        result[family] = {
+            "median": _r(median, 1),
+            "n": len(window_values),
+            "high": sum(1 for v in window_values if v > config.durability_high_drift_pct),
+            "high_7d": sum(1 for v in acute_values if v > config.durability_high_drift_pct),
+            "trend": trend,
+        }
+    result["excluded"] = sum(reasons.values())
+    result["reasons"] = dict(sorted(reasons.items()))
+    return result
+
+
+def efficiency_factor(
+    activities: list[Activity], end: date, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """Mean efficiency factor (NP / avg HR) of steady rides, 7 vs. 28 days.
+
+    Qualifying: cycling type, ``icu_efficiency_factor`` present, 0 < VI <= 1.05 and
+    at least 20 min moving. Each mean needs ``ef_min_sessions`` values. Trend:
+    7-day minus 28-day mean, +/- ``ef_trend_band`` = stable; rising = better aerobic
+    efficiency.
+    """
+
+    def qualifying(window_days: int) -> list[float]:
+        start = end - timedelta(days=window_days - 1)
+        values = []
+        for activity in activities_between(activities, start, end):
+            ef = _num(activity.get("icu_efficiency_factor"))
+            vi = _num(activity.get("icu_variability_index"))
+            moving = _num(activity.get("moving_time")) or 0.0
+            if (
+                activity.get("type") in config.ef_types
+                and ef is not None
+                and vi is not None
+                and 0 < vi <= config.ef_max_vi
+                and moving >= config.ef_min_moving_s
+            ):
+                values.append(ef)
+        return values
+
+    acute = qualifying(config.acute_days)
+    chronic = qualifying(config.chronic_days)
+    acute_mean = statistics.mean(acute) if len(acute) >= config.ef_min_sessions else None
+    chronic_mean = statistics.mean(chronic) if len(chronic) >= config.ef_min_sessions else None
+    trend = None
+    if acute_mean is not None and chronic_mean is not None:
+        delta = acute_mean - chronic_mean
+        if delta > config.ef_trend_band:
+            trend = "improving"
+        elif delta < -config.ef_trend_band:
+            trend = "declining"
+        else:
+            trend = "stable"
+    return {
+        "ef_7d": _r(acute_mean, 2),
+        "ef_28d": _r(chronic_mean, 2),
+        "n_7d": len(acute),
+        "n_28d": len(chronic),
+        "trend": trend,
+    }
+
+
+def eftp_by_day(wellness: dict[date, WellnessRecord]) -> dict[date, float]:
+    """Cycling eFTP per day from ``wellness.sportInfo`` (entry with type Ride)."""
+    series = {}
+    for day, record in wellness.items():
+        sport_info = record.get("sportInfo")
+        if not isinstance(sport_info, list):
+            continue
+        for entry in sport_info:
+            if isinstance(entry, dict) and entry.get("type") == "Ride":
+                value = _num(entry.get("eftp"))
+                if value is not None and value > 0:
+                    series[day] = value
+    return series
+
+
+def _nearest_value(series: dict[date, float], target: date, tolerance: int) -> float | None:
+    """Value of the day closest to ``target`` within +/- ``tolerance`` days (earlier wins ties)."""
+    for distance in range(tolerance + 1):
+        for day in (target - timedelta(days=distance), target + timedelta(days=distance)):
+            if day in series:
+                return series[day]
+    return None
+
+
+def eftp_trend(
+    wellness: dict[date, WellnessRecord], end: date, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """Cycling eFTP now vs. 28 and 56 days ago, in W and %.
+
+    Stateless replacement for Section 11's benchmark index (which needs a local FTP
+    history file): Intervals.icu stores the eFTP estimate on every wellness day.
+    """
+    series = {day: value for day, value in eftp_by_day(wellness).items() if day <= end}
+    now = _nearest_value(series, end, config.eftp_tolerance_days)
+    result: dict[str, Any] = {"now": _r(now, 0)}
+    for lookback in config.eftp_lookback_days:
+        past = _nearest_value(series, end - timedelta(days=lookback), config.eftp_tolerance_days)
+        result[f"d{lookback}"] = _r(past, 0)
+        result[f"pct_{lookback}"] = (
+            _r((now / past - 1) * 100, 1) if now is not None and past is not None else None
+        )
+    return result
