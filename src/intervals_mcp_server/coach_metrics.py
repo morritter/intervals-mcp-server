@@ -422,3 +422,142 @@ def weekly_volume(
             }
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Recovery
+# ---------------------------------------------------------------------------
+
+
+def _valid_hrv(record: WellnessRecord, config: CoachConfig) -> float | None:
+    """rMSSD if it lies in the plausible range, else None (sensor errors)."""
+    value = _num(record.get("hrv"))
+    if value is None or not config.hrv_valid_min <= value <= config.hrv_valid_max:
+        return None
+    return value
+
+
+def hrv_status(
+    wellness: dict[date, WellnessRecord], end: date, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """HRV trend: 7-day mean of ln(rMSSD) vs. the baseline normal range.
+
+    Baseline = all valid values in the ``baseline_days`` ending at ``end``; normal
+    range = baseline mean +/- ``hrv_band_k`` x baseline SD. Status is
+    ``below``/``within``/``above``, or ``insufficient_data`` when the 7-day window
+    or the baseline has too few values. ``days_below`` counts consecutive days
+    (backwards from ``end``) whose ln(rMSSD) is below the range; a day without a
+    value ends the streak.
+    """
+    baseline_window = days_back(end, config.baseline_days)
+    raw = {
+        day: value
+        for day in baseline_window
+        if (value := _valid_hrv(wellness.get(day, {}), config)) is not None
+    }
+    ln_values = {day: math.log(value) for day, value in raw.items()}
+    acute_window = baseline_window[-config.acute_days :]
+    acute_ln = [ln_values[day] for day in acute_window if day in ln_values]
+    baseline_ln = list(ln_values.values())
+
+    counts = {"n_7d": len(acute_ln), "n_base": len(baseline_ln)}
+    if (
+        len(acute_ln) < config.hrv_min_points_acute
+        or len(baseline_ln) < max(config.hrv_min_points_baseline, 2)
+    ):
+        return {"status": "insufficient_data", **counts}
+
+    acute_mean = statistics.mean(acute_ln)
+    baseline_mean = statistics.mean(baseline_ln)
+    baseline_sd = statistics.stdev(baseline_ln)
+    lower = baseline_mean - config.hrv_band_k * baseline_sd
+    upper = baseline_mean + config.hrv_band_k * baseline_sd
+    if acute_mean < lower:
+        status = "below"
+    elif acute_mean > upper:
+        status = "above"
+    else:
+        status = "within"
+
+    days_below = 0
+    for day in reversed(baseline_window):
+        if day in ln_values and ln_values[day] < lower:
+            days_below += 1
+        else:
+            break
+
+    return {
+        "status": status,
+        "ln_7d": _r(acute_mean, 2),
+        "ln_base": _r(baseline_mean, 2),
+        "band": [_r(lower, 2), _r(upper, 2)],
+        "rmssd_7d": _r(statistics.mean(raw[day] for day in acute_window if day in raw), 0),
+        "days_below": days_below,
+        **counts,
+    }
+
+
+def rhr_status(
+    wellness: dict[date, WellnessRecord], end: date, config: CoachConfig = DEFAULT_CONFIG
+) -> dict[str, Any]:
+    """Resting HR: 7-day mean vs. baseline mean (difference in bpm).
+
+    ``days_high`` counts consecutive days (backwards from ``end``) with a resting
+    HR at least ``rhr_high_delta_bpm`` above the baseline mean.
+    """
+    baseline_window = days_back(end, config.baseline_days)
+    values = {}
+    for day in baseline_window:
+        value = _num(wellness.get(day, {}).get("restingHR"))
+        if value is not None and value > 0:
+            values[day] = value
+    acute = [values[day] for day in baseline_window[-config.acute_days :] if day in values]
+    counts = {"n_7d": len(acute), "n_base": len(values)}
+    if len(acute) < config.rhr_min_points_acute or len(values) < config.rhr_min_points_baseline:
+        return {"status": "insufficient_data", **counts}
+
+    acute_mean = statistics.mean(acute)
+    baseline_mean = statistics.mean(values.values())
+    days_high = 0
+    for day in reversed(baseline_window):
+        if day in values and values[day] >= baseline_mean + config.rhr_high_delta_bpm:
+            days_high += 1
+        else:
+            break
+    return {
+        "avg_7d": _r(acute_mean, 1),
+        "avg_base": _r(baseline_mean, 1),
+        "delta": _r(acute_mean - baseline_mean, 1),
+        "days_high": days_high,
+        **counts,
+    }
+
+
+def sleep_summary(
+    wellness: dict[date, WellnessRecord],
+    end: date,
+    days: int,
+    config: CoachConfig = DEFAULT_CONFIG,
+) -> dict[str, Any]:
+    """Sleep over the report window: average, 7-day average, short nights, last nights.
+
+    ``recent_h`` lists the last ``sleep_recent_nights`` nights oldest first, with
+    None for nights without data.
+    """
+    hours = {}
+    for day in days_back(end, max(days, config.acute_days)):
+        secs = _num(wellness.get(day, {}).get("sleepSecs"))
+        if secs is not None and secs > 0:
+            hours[day] = secs / 3600
+    window = [hours[day] for day in days_back(end, days) if day in hours]
+    acute = [hours[day] for day in days_back(end, config.acute_days) if day in hours]
+    return {
+        "avg_h": _r(statistics.mean(window), 1) if window else None,
+        "avg_7d_h": _r(statistics.mean(acute), 1) if acute else None,
+        "nights_short": sum(1 for value in window if value < config.sleep_short_hours),
+        "recent_h": [
+            _r(hours[day], 1) if day in hours else None
+            for day in days_back(end, config.sleep_recent_nights)
+        ],
+        "n": len(window),
+    }

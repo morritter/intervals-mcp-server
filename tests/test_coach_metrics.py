@@ -207,3 +207,94 @@ def test_weekly_volume_partial_week_has_no_monotony():
     assert rows[0]["days"] == 2
     assert rows[0]["monotony"] is None
     assert rows[1]["monotony"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Recovery
+# ---------------------------------------------------------------------------
+
+
+def _hrv_days(values_by_offset):
+    return cm.wellness_by_day(
+        [wellness(days_before(END, offset), hrv=value) for offset, value in values_by_offset.items()]
+    )
+
+
+def test_hrv_within_band():
+    days = _hrv_days({offset: 80.0 + (offset % 4) for offset in range(60)})
+    result = cm.hrv_status(days, END)
+    assert result["status"] == "within"
+    assert result["n_7d"] == 7
+    assert result["n_base"] == 60
+    assert result["band"][0] < result["ln_7d"] < result["band"][1]
+
+
+def test_hrv_below_and_persistence():
+    values = {offset: 80.0 + (offset % 4) for offset in range(7, 60)}
+    values.update(dict.fromkeys(range(7), 55.0))
+    result = cm.hrv_status(_hrv_days(values), END)
+    assert result["status"] == "below"
+    assert result["days_below"] == 7
+    assert result["rmssd_7d"] == 55
+
+
+def test_hrv_above():
+    values = {offset: 80.0 + (offset % 4) for offset in range(7, 60)}
+    values.update(dict.fromkeys(range(7), 120.0))
+    assert cm.hrv_status(_hrv_days(values), END)["status"] == "above"
+
+
+def test_hrv_missing_value_breaks_streak():
+    values = {offset: 80.0 + (offset % 4) for offset in range(3, 60)}
+    values.update({0: 50.0, 2: 50.0, 1: None})
+    result = cm.hrv_status(_hrv_days(values), END)
+    assert result["days_below"] == 1
+
+
+def test_hrv_insufficient_data_and_invalid_values():
+    values = dict.fromkeys(range(10, 60), 80.0)
+    values.update({0: 5.0, 1: 300.0, 2: None, 3: 80.0})  # 5 and 300 are sensor errors
+    result = cm.hrv_status(_hrv_days(values), END)
+    assert result == {"status": "insufficient_data", "n_7d": 1, "n_base": 51}
+    assert cm.hrv_status({}, END)["status"] == "insufficient_data"
+
+
+def test_hrv_zero_sd_baseline_collapses_band():
+    result = cm.hrv_status(_hrv_days(dict.fromkeys(range(60), 80.0)), END)
+    assert result["status"] == "within"
+    assert result["band"][0] == result["band"][1]
+
+
+def test_rhr_delta_and_days_high():
+    records = [wellness(days_before(END, offset), rhr=40.0) for offset in range(3, 60)]
+    records += [wellness(days_before(END, offset), rhr=47.0) for offset in range(3)]
+    result = cm.rhr_status(cm.wellness_by_day(records), END)
+    assert result["avg_base"] == round((57 * 40 + 3 * 47) / 60, 1)
+    assert result["days_high"] == 3
+    assert result["delta"] > 0
+
+
+def test_rhr_missing():
+    records = [wellness(days_before(END, offset), rhr=None) for offset in range(60)]
+    assert cm.rhr_status(cm.wellness_by_day(records), END)["status"] == "insufficient_data"
+
+
+def test_sleep_summary_with_missing_nights():
+    records = [wellness(days_before(END, offset), sleep_h=7.5) for offset in range(3, 28)]
+    records += [
+        wellness(END, sleep_h=6.5),
+        wellness(days_before(END, 1), sleep_h=None),
+        wellness(days_before(END, 2), sleep_h=6.0),
+    ]
+    result = cm.sleep_summary(cm.wellness_by_day(records), END, 28)
+    assert result["n"] == 27
+    assert result["nights_short"] == 2
+    assert result["recent_h"] == [6.0, None, 6.5]
+    assert result["avg_7d_h"] == round((4 * 7.5 + 6.5 + 6.0) / 6, 1)
+
+
+def test_sleep_summary_without_data():
+    result = cm.sleep_summary({}, END, 28)
+    assert result["avg_h"] is None
+    assert result["recent_h"] == [None, None, None]
+    assert result["n"] == 0
