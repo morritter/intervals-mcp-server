@@ -1022,3 +1022,316 @@ def eftp_trend(
             _r((now / past - 1) * 100, 1) if now is not None and past is not None else None
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Thresholds, top sessions, coverage
+# ---------------------------------------------------------------------------
+
+
+def _sport_setting(athlete: dict[str, Any], activity_type: str) -> dict[str, Any]:
+    """First sport settings entry that covers ``activity_type``."""
+    settings = athlete.get("sportSettings")
+    if isinstance(settings, list):
+        for entry in settings:
+            types = entry.get("types") if isinstance(entry, dict) else None
+            if isinstance(types, list) and activity_type in types:
+                return entry
+    return {}
+
+
+def athlete_thresholds(athlete: dict[str, Any]) -> dict[str, Any]:
+    """FTP (outdoor/indoor) and LTHR from the athlete's sport settings."""
+    ride = _sport_setting(athlete, "Ride")
+    run = _sport_setting(athlete, "Run")
+    return {
+        "ftp": _r(_num(ride.get("ftp")), 0),
+        "ftp_indoor": _r(_num(ride.get("indoor_ftp")), 0),
+        "lthr_rad": _r(_num(ride.get("lthr")), 0),
+        "lthr_lauf": _r(_num(run.get("lthr")), 0),
+    }
+
+
+def intensity_factor(activity: Activity) -> float | None:
+    """IF as a fraction; Intervals.icu reports ``icu_intensity`` in percent."""
+    value = _num(activity.get("icu_intensity"))
+    if value is None or value <= 0:
+        return None
+    return value / 100 if value > 3 else value
+
+
+def top_sessions(activities: list[Activity], config: CoachConfig = DEFAULT_CONFIG) -> list[dict[str, Any]]:
+    """The ``top_n`` most notable sessions: highest load first.
+
+    If the session with the highest IF is not among them, it replaces the last
+    entry, so the hardest short session is not hidden behind long easy ones.
+    Ties are broken by IF, then by the most recent date.
+    """
+    if config.top_n <= 0 or not activities:
+        return []
+    ordered = sorted(
+        activities,
+        key=lambda a: (
+            -activity_load(a),
+            -(intensity_factor(a) or 0.0),
+            -(activity_day(a) or date.min).toordinal(),
+        ),
+    )
+    top = ordered[: config.top_n]
+    with_if = [a for a in activities if intensity_factor(a) is not None]
+    if with_if and len(top) == config.top_n:
+        hardest = max(with_if, key=lambda a: (intensity_factor(a) or 0.0, activity_load(a)))
+        if not any(entry is hardest for entry in top):
+            top[-1] = hardest
+    return [
+        {
+            "date": (activity_day(a) or date.min).isoformat(),
+            "type": sport_family(a.get("type")),
+            "min": _r((_num(a.get("moving_time")) or 0.0) / 60, 0),
+            "load": _r(activity_load(a), 0),
+            "if": _r(intensity_factor(a), 2),
+        }
+        for a in top
+    ]
+
+
+def _has_rpe(activity: Activity) -> bool:
+    return _num(activity.get("icu_rpe")) is not None or _num(activity.get("perceived_exertion")) is not None
+
+
+def _has_feel(activity: Activity) -> bool:
+    return _num(activity.get("feel")) is not None
+
+
+def coverage(
+    activities: list[Activity],
+    wellness: dict[date, WellnessRecord],
+    end: date,
+    days: int,
+    config: CoachConfig = DEFAULT_CONFIG,
+) -> dict[str, Any]:
+    """How much data the report is based on (window days and sessions)."""
+    window = days_back(end, days)
+    zones = {"power": 0, "hr": 0, "none": 0}
+    for activity in activities:
+        _, basis = activity_zones(activity)
+        zones[basis or "none"] += 1
+    return {
+        "days": days,
+        "hrv_days": sum(1 for day in window if _valid_hrv(wellness.get(day, {}), config) is not None),
+        "rhr_days": sum(1 for day in window if (_num(wellness.get(day, {}).get("restingHR")) or 0) > 0),
+        "sleep_days": sum(1 for day in window if (_num(wellness.get(day, {}).get("sleepSecs")) or 0) > 0),
+        "sessions": len(activities),
+        "zones": zones,
+        "rpe": sum(1 for a in activities if _has_rpe(a)),
+        "feel": sum(1 for a in activities if _has_feel(a)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+
+_SEVERITY_ORDER = {"alarm": 0, "warning": 1, "info": 2}
+
+
+def _flag(code: str, severity: str, value: Any, threshold: Any) -> dict[str, Any]:
+    return {"code": code, "sev": severity, "val": value, "thr": threshold}
+
+
+def _last_session_days(
+    activities: list[Activity], end: date, family: str
+) -> int | None:
+    days = [
+        (end - day).days
+        for a in activities
+        if sport_family(a.get("type")) == family and (day := activity_day(a)) is not None and day <= end
+    ]
+    return min(days) if days else None
+
+
+def build_flags(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    report: dict[str, Any],
+    activities: list[Activity],
+    window_activities: list[Activity],
+    end: date,
+    history_days: int,
+    config: CoachConfig = DEFAULT_CONFIG,
+) -> list[dict[str, Any]]:
+    """Rule-based hints from the computed report, sorted alarm > warning > info.
+
+    Every flag is ``{code, sev, val, thr}``; all thresholds come from ``config``.
+    """
+    flags: list[dict[str, Any]] = []
+
+    thresholds = report["thresholds"]
+    eftp_now = report["capability"]["eftp"]["now"]
+    if eftp_now:
+        for key, code in (("ftp", "ftp_eftp_dev"), ("ftp_indoor", "ftp_indoor_eftp_dev")):
+            ftp = thresholds.get(key)
+            if not ftp or (key == "ftp_indoor" and ftp == thresholds.get("ftp")):
+                continue
+            deviation = (ftp / eftp_now - 1) * 100
+            if abs(deviation) > config.ftp_eftp_max_dev_pct:
+                flags.append(_flag(code, "warning", _r(deviation, 1), config.ftp_eftp_max_dev_pct))
+
+    for sport in config.tracked_sports:
+        since = _last_session_days(activities, end, sport)
+        if since is None:
+            flags.append(_flag(f"sport_inactive:{sport}", "info", f">{history_days}", config.sport_inactive_days))
+        elif since > config.sport_inactive_days:
+            flags.append(_flag(f"sport_inactive:{sport}", "info", since, config.sport_inactive_days))
+
+    load = report["load"]
+    acwr = load["acwr"]
+    if acwr is not None:
+        if acwr >= config.acwr_high_alarm:
+            flags.append(_flag("acwr_high", "alarm", acwr, config.acwr_high_alarm))
+        elif acwr > config.acwr_high_warn:
+            flags.append(_flag("acwr_high", "warning", acwr, config.acwr_high_warn))
+        elif acwr <= config.acwr_low_alarm:
+            flags.append(_flag("acwr_low", "alarm", acwr, config.acwr_low_alarm))
+        elif acwr < config.acwr_low_warn:
+            flags.append(_flag("acwr_low", "warning", acwr, config.acwr_low_warn))
+
+    effective = load["effective_monotony"]
+    if effective is not None and effective > config.monotony_warn:
+        severity, threshold = "warning", config.monotony_warn
+        if effective >= config.monotony_alarm:
+            severity, threshold = "alarm", config.monotony_alarm
+        if load["deload"]:
+            severity = "info"
+        flags.append(_flag("monotony_high", severity, effective, threshold))
+
+    hrv = report["recovery"]["hrv"]
+    if hrv["status"] == "below":
+        severity = "alarm" if hrv["days_below"] >= config.hrv_alarm_days else "warning"
+        flags.append(_flag("hrv_below", severity, hrv["ln_7d"], hrv["band"][0]))
+    elif hrv["status"] == "insufficient_data":
+        flags.append(_flag("hrv_insufficient", "info", hrv["n_7d"], config.hrv_min_points_acute))
+
+    rhr = report["recovery"]["rhr"]
+    days_high = rhr.get("days_high", 0)
+    if days_high >= config.rhr_alarm_days:
+        flags.append(_flag("rhr_elevated_days", "alarm", days_high, config.rhr_alarm_days))
+    elif days_high >= config.rhr_warn_days:
+        flags.append(_flag("rhr_elevated_days", "warning", days_high, config.rhr_warn_days))
+
+    recent = report["recovery"]["sleep"]["recent_h"]
+    short_nights = sum(1 for hours in recent if hours is not None and hours < config.sleep_short_hours)
+    if short_nights >= config.sleep_short_min_nights:
+        flags.append(_flag("sleep_short", "warning", short_nights, config.sleep_short_min_nights))
+
+    if window_activities:
+        missing = sum(1 for a in window_activities if not _has_rpe(a) and not _has_feel(a))
+        share = missing / len(window_activities)
+        if share > config.subjective_missing_share:
+            flags.append(_flag("subjective_missing", "info", _r(share, 2), config.subjective_missing_share))
+
+    durability_result = report["capability"]["durability"]
+    for family in (RAD, LAUF):
+        entry = durability_result[family]
+        if entry["median"] is not None and entry["median"] > config.durability_high_drift_pct:
+            flags.append(_flag(f"durability_high:{family}", "warning", entry["median"], config.durability_high_drift_pct))
+        elif entry["high_7d"] >= config.durability_high_drift_count_7d:
+            flags.append(_flag(f"durability_high_7d:{family}", "warning", entry["high_7d"], config.durability_high_drift_count_7d))
+
+    drift = report["intensity"]["drift"]
+    if drift["drift"] == "acute_depolarization":
+        flags.append(_flag("tid_depolarization", "warning", drift["pi_7d"], config.pi_polarized_min))
+
+    return sorted(flags, key=lambda flag: _SEVERITY_ORDER[flag["sev"]])
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+
+def _zone_map_label(mapping: tuple[int, ...]) -> str:
+    """Readable mapping such as ``Z1-Z2|Z3|Z4-Z7``."""
+    groups = []
+    for target in (1, 2, 3):
+        zones = [index + 1 for index, value in enumerate(mapping) if value == target]
+        if not zones:
+            groups.append("-")
+        elif len(zones) == 1:
+            groups.append(f"Z{zones[0]}")
+        else:
+            groups.append(f"Z{zones[0]}-Z{zones[-1]}")
+    return "|".join(groups)
+
+
+def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    activities: Any,
+    wellness: Any,
+    athlete: Any,
+    end: date,
+    days: int,
+    config: CoachConfig = DEFAULT_CONFIG,
+) -> dict[str, Any]:
+    """Assemble the complete coach report from raw Intervals.icu data.
+
+    Args:
+        activities: activity dicts covering at least ``max(days, 28)`` days up to ``end``.
+        wellness: wellness records (list or date-keyed dict) covering at least
+            ``max(days, 60)`` days up to ``end``.
+        athlete: the athlete record (for sport settings).
+        end: last day of the report (inclusive).
+        days: length of the report window in days.
+        config: thresholds and mappings.
+
+    Returns:
+        A JSON-serialisable dict with fixed keys and ``schema_version``.
+    """
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    acts = [a for a in activities if isinstance(a, dict)] if isinstance(activities, list) else []
+    acts = [a for a in acts if (day := activity_day(a)) is not None and day <= end]
+    well = wellness_by_day(wellness)
+    athlete_record = athlete if isinstance(athlete, dict) else {}
+    start = end - timedelta(days=days - 1)
+    window_acts = activities_between(acts, start, end)
+
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "period": {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "days": days,
+            "windows": {
+                "acute": config.acute_days,
+                "chronic": config.chronic_days,
+                "baseline": config.baseline_days,
+            },
+        },
+        "flags": [],
+        "load": {**fitness_status(well, acts, end), **load_metrics(acts, end, config)},
+        "recovery": {
+            "hrv": hrv_status(well, end, config),
+            "rhr": rhr_status(well, end, config),
+            "sleep": sleep_summary(well, end, days, config),
+        },
+        "volume": weekly_volume(acts, end, days, config),
+        "intensity": {
+            "map": {
+                "power": _zone_map_label(config.power_zone_map),
+                "hr": _zone_map_label(config.hr_zone_map),
+            },
+            "all": intensity_distribution(window_acts, config),
+            "rad": intensity_distribution(window_acts, config, RAD),
+            "drift": tid_drift(acts, end, config),
+        },
+        "capability": {
+            "durability": durability(acts, end, days, config),
+            "ef": efficiency_factor(acts, end, config),
+            "eftp": eftp_trend(well, end, config),
+        },
+        "top_sessions": top_sessions(window_acts, config),
+        "thresholds": athlete_thresholds(athlete_record),
+        "coverage": coverage(window_acts, well, end, days, config),
+    }
+    report["flags"] = build_flags(
+        report, acts, window_acts, end, max(days, config.chronic_days), config
+    )
+    return report

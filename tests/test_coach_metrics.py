@@ -2,6 +2,7 @@
 Unit tests for the pure coach_metrics module (no network).
 """
 
+import json
 import math
 import pathlib
 import sys
@@ -12,7 +13,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from intervals_mcp_server import coach_metrics as cm  # pylint: disable=wrong-import-position  # noqa: E402
-from tests.coach_fixtures import END, activity, days_before, power_zones, wellness  # pylint: disable=wrong-import-position  # noqa: E402
+from tests.coach_fixtures import END, activity, athlete, days_before, power_zones, realistic_scenario, wellness  # pylint: disable=wrong-import-position  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -544,3 +545,233 @@ def test_eftp_trend_with_gaps():
 
 def test_eftp_trend_without_data():
     assert cm.eftp_trend({}, END)["now"] is None
+
+
+# ---------------------------------------------------------------------------
+# Thresholds, top sessions, coverage
+# ---------------------------------------------------------------------------
+
+
+def test_athlete_thresholds():
+    assert cm.athlete_thresholds(athlete(ftp=343, indoor_ftp=330)) == {
+        "ftp": 343,
+        "ftp_indoor": 330,
+        "lthr_rad": 170,
+        "lthr_lauf": 173,
+    }
+    assert cm.athlete_thresholds({}) == {"ftp": None, "ftp_indoor": None, "lthr_rad": None, "lthr_lauf": None}
+
+
+def test_intensity_factor_converts_percent():
+    assert cm.intensity_factor(activity(END, intensity=56.85)) == pytest.approx(0.5685)
+    assert cm.intensity_factor(activity(END, intensity=0.85)) == pytest.approx(0.85)
+    assert cm.intensity_factor(activity(END, intensity=None)) is None
+
+
+def test_top_sessions_by_load_with_hardest_session_included():
+    acts = [activity(days_before(END, offset), load=load, intensity=60.0) for offset, load in enumerate([300, 250, 200, 150, 100])]
+    acts.append(activity(days_before(END, 6), load=40, moving=1800, intensity=105.0))
+    top = cm.top_sessions(acts)
+    assert [entry["load"] for entry in top] == [300, 250, 200, 150, 40]
+    assert top[-1] == {"date": days_before(END, 6).isoformat(), "type": cm.RAD, "min": 30, "load": 40, "if": 1.05}
+
+
+def test_top_sessions_ties_prefer_recent():
+    acts = [activity(days_before(END, offset), load=100, intensity=70.0) for offset in (5, 1, 3)]
+    assert [entry["date"] for entry in cm.top_sessions(acts)] == [
+        days_before(END, 1).isoformat(),
+        days_before(END, 3).isoformat(),
+        days_before(END, 5).isoformat(),
+    ]
+    assert cm.top_sessions([]) == []
+
+
+def test_coverage_counts():
+    acts = [
+        activity(END, zones=power_zones(100, 0, 0, 0, 0, 0, 0), rpe=5),
+        activity(END, "Run", zones=None, hr_zones=[100, 0, 0, 0, 0], feel=2),
+        activity(END, "WeightTraining", zones=None, hr_zones=None),
+    ]
+    records = cm.wellness_by_day([wellness(END), wellness(days_before(END, 1), hrv=None, rhr=None, sleep_h=None)])
+    assert cm.coverage(acts, records, END, 7) == {
+        "days": 7,
+        "hrv_days": 1,
+        "rhr_days": 1,
+        "sleep_days": 1,
+        "sessions": 3,
+        "zones": {"power": 1, "hr": 1, "none": 1},
+        "rpe": 1,
+        "feel": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+
+
+def _report_and_inputs():
+    acts, records, athlete_record = realistic_scenario()
+    report = cm.build_coach_report(acts, records, athlete_record, END, 28)
+    window = cm.activities_between(acts, days_before(END, 27), END)
+    return report, acts, window
+
+
+def _codes(report, acts, window, **overrides):
+    return {flag["code"]: flag for flag in cm.build_flags(report, acts, window, END, 28, cm.CoachConfig(**overrides))}
+
+
+def test_ftp_eftp_deviation_flag():
+    report, acts, window = _report_and_inputs()
+    flag = _codes(report, acts, window)["ftp_eftp_dev"]
+    assert flag == {"code": "ftp_eftp_dev", "sev": "warning", "val": round((343 / 352 - 1) * 100, 1), "thr": 2.0}
+    report["thresholds"]["ftp"] = 350
+    assert "ftp_eftp_dev" not in _codes(report, acts, window)
+    report["thresholds"]["ftp_indoor"] = 350  # same as outdoor -> not repeated
+    assert "ftp_indoor_eftp_dev" not in _codes(report, acts, window)
+    report["thresholds"]["ftp_indoor"] = 330
+    assert _codes(report, acts, window)["ftp_indoor_eftp_dev"]["val"] == round((330 / 352 - 1) * 100, 1)
+
+
+def test_sport_inactive_flag():
+    report, acts, window = _report_and_inputs()
+    assert not any(code.startswith("sport_inactive") for code in _codes(report, acts, window))
+    reduced = [a for a in acts if a["type"] != "Swim" and not (a["type"] == "Run" and a["start_date_local"] >= days_before(END, 8).isoformat())]
+    codes = _codes(report, reduced, window)
+    assert codes["sport_inactive:Schwimmen"]["val"] == ">28"
+    assert codes["sport_inactive:Lauf"]["val"] == 11
+
+
+@pytest.mark.parametrize(
+    ("acwr", "code", "severity"),
+    [(1.3, None, None), (1.31, "acwr_high", "warning"), (1.35, "acwr_high", "alarm"),
+     (0.8, None, None), (0.79, "acwr_low", "warning"), (0.75, "acwr_low", "alarm")],
+)
+def test_acwr_flag_boundaries(acwr, code, severity):
+    report, acts, window = _report_and_inputs()
+    report["load"]["acwr"] = acwr
+    codes = _codes(report, acts, window)
+    if code is None:
+        assert "acwr_high" not in codes and "acwr_low" not in codes
+    else:
+        assert codes[code]["sev"] == severity
+
+
+@pytest.mark.parametrize(
+    ("value", "deload", "severity"),
+    [(2.0, False, None), (2.01, False, "warning"), (2.5, False, "alarm"), (2.6, True, "info")],
+)
+def test_monotony_flag(value, deload, severity):
+    report, acts, window = _report_and_inputs()
+    report["load"]["effective_monotony"] = value
+    report["load"]["deload"] = deload
+    flag = _codes(report, acts, window).get("monotony_high")
+    assert (flag["sev"] if flag else None) == severity
+
+
+def test_hrv_flags():
+    report, acts, window = _report_and_inputs()
+    report["recovery"]["hrv"].update(status="below", days_below=2)
+    assert _codes(report, acts, window)["hrv_below"]["sev"] == "warning"
+    report["recovery"]["hrv"]["days_below"] = 3
+    assert _codes(report, acts, window)["hrv_below"]["sev"] == "alarm"
+    report["recovery"]["hrv"] = {"status": "insufficient_data", "n_7d": 2, "n_base": 10}
+    assert _codes(report, acts, window)["hrv_insufficient"]["sev"] == "info"
+
+
+@pytest.mark.parametrize(("days_high", "severity"), [(1, None), (2, "warning"), (3, "alarm")])
+def test_rhr_flag(days_high, severity):
+    report, acts, window = _report_and_inputs()
+    report["recovery"]["rhr"]["days_high"] = days_high
+    flag = _codes(report, acts, window).get("rhr_elevated_days")
+    assert (flag["sev"] if flag else None) == severity
+
+
+def test_rhr_flag_with_insufficient_data():
+    report, acts, window = _report_and_inputs()
+    report["recovery"]["rhr"] = {"status": "insufficient_data", "n_7d": 0, "n_base": 0}
+    assert "rhr_elevated_days" not in _codes(report, acts, window)
+
+
+@pytest.mark.parametrize(("recent", "flagged"), [([6.9, None, 6.5], True), ([6.9, 7.2, 7.5], False), ([None, None, None], False)])
+def test_sleep_flag(recent, flagged):
+    report, acts, window = _report_and_inputs()
+    report["recovery"]["sleep"]["recent_h"] = recent
+    assert ("sleep_short" in _codes(report, acts, window)) is flagged
+
+
+def test_subjective_missing_flag_threshold():
+    report, acts, _ = _report_and_inputs()
+    window = [activity(END, rpe=5)] + [activity(END) for _ in range(4)]  # 80 % missing -> not above
+    assert "subjective_missing" not in _codes(report, acts, window)
+    window = [activity(END) for _ in range(5)]
+    assert _codes(report, acts, window)["subjective_missing"]["val"] == 1.0
+    assert "subjective_missing" not in _codes(report, acts, [])
+
+
+def test_durability_flags():
+    report, acts, window = _report_and_inputs()
+    report["capability"]["durability"][cm.RAD]["median"] = 5.5
+    report["capability"]["durability"][cm.LAUF].update(median=3.0, high_7d=3)
+    codes = _codes(report, acts, window)
+    assert codes["durability_high:Rad"]["val"] == 5.5
+    assert codes["durability_high_7d:Lauf"]["val"] == 3
+
+
+def test_tid_depolarization_flag_and_sorting():
+    report, acts, window = _report_and_inputs()
+    report["intensity"]["drift"].update(drift="acute_depolarization", pi_7d=1.7)
+    report["load"]["acwr"] = 1.5
+    flags = cm.build_flags(report, acts, window, END, 28)
+    assert any(flag["code"] == "tid_depolarization" for flag in flags)
+    severities = [flag["sev"] for flag in flags]
+    assert severities == sorted(severities, key={"alarm": 0, "warning": 1, "info": 2}.get)
+    assert severities[0] == "alarm"
+
+
+# ---------------------------------------------------------------------------
+# Full report
+# ---------------------------------------------------------------------------
+
+REPORT_KEYS = [
+    "schema_version", "period", "flags", "load", "recovery", "volume",
+    "intensity", "capability", "top_sessions", "thresholds", "coverage",
+]
+
+
+def test_report_structure_and_size():
+    acts, records, athlete_record = realistic_scenario()
+    report = cm.build_coach_report(acts, records, athlete_record, END, 28)
+    assert list(report) == REPORT_KEYS
+    assert report["schema_version"] == cm.SCHEMA_VERSION
+    assert report["period"] == {
+        "start": "2026-08-31", "end": "2026-09-27", "days": 28,
+        "windows": {"acute": 7, "chronic": 28, "baseline": 60},
+    }
+    assert len(report["volume"]) == 4
+    assert len(report["top_sessions"]) == 5
+    payload = json.dumps(report, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    assert len(payload.encode("utf-8")) < 4096
+
+
+def test_report_without_any_data():
+    report = cm.build_coach_report([], [], {}, END, 28)
+    json.dumps(report, allow_nan=False)
+    assert list(report) == REPORT_KEYS
+    assert report["load"]["acwr"] is None
+    assert report["load"]["ctl"] is None
+    assert report["recovery"]["hrv"]["status"] == "insufficient_data"
+    assert report["intensity"]["all"]["cls"] is None
+    assert report["top_sessions"] == []
+    assert all(week["rest_days"] == 7 for week in report["volume"])
+    codes = {flag["code"] for flag in report["flags"]}
+    assert "hrv_insufficient" in codes
+    assert "sport_inactive:Rad" in codes
+
+
+def test_report_ignores_activities_after_end_and_bad_input():
+    acts = [activity(END + (END - days_before(END, 1)), load=500), "not a dict"]
+    report = cm.build_coach_report(acts, None, None, END, 7)
+    assert report["load"]["load_7d"] == 0
+    with pytest.raises(ValueError):
+        cm.build_coach_report([], [], {}, END, 0)
