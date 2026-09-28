@@ -7,6 +7,7 @@ This module only fetches data. All numbers are computed by the pure
 
 import asyncio
 import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,7 +15,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.coach_metrics import DEFAULT_CONFIG, build_coach_report, default_load_end
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.utils.validation import validate_date
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
@@ -23,6 +23,23 @@ config = get_config()
 
 MIN_DAYS = 7
 MAX_DAYS = 90
+MIN_END_DATE = date(2000, 1, 1)
+MAX_END_DATE = date(2100, 12, 31)
+_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _parse_end_date(value: str) -> date | None:
+    """Strict YYYY-MM-DD within a plausible range, else None.
+
+    The range keeps the window arithmetic away from date.min/date.max.
+    """
+    if not _DATE_PATTERN.fullmatch(value):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if MIN_END_DATE <= parsed <= MAX_END_DATE else None
 
 
 def _athlete_today(athlete: Any) -> date:
@@ -109,10 +126,12 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
         return f"Error: days must be between {MIN_DAYS} and {MAX_DAYS}."
     end: date | None = None
     if end_date:
-        try:
-            end = date.fromisoformat(validate_date(end_date))
-        except ValueError as exc:
-            return f"Error: {exc}"
+        end = _parse_end_date(end_date)
+        if end is None:
+            return (
+                "Error: end_date must be a valid date in YYYY-MM-DD format between "
+                f"{MIN_END_DATE.isoformat()} and {MAX_END_DATE.isoformat()}."
+            )
 
     athlete_id = config.athlete_id
     if not athlete_id:

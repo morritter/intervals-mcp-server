@@ -228,10 +228,10 @@ async def make_intervals_request(
     except httpx.HTTPStatusError as e:
         return _handle_http_status_error(e)
     except httpx.RequestError as e:
-        logger.error("Request error: %s", str(e))
+        logger.error("Request error: %s", _redact(str(e)))
         return {"error": True, "message": f"Request error: {str(e)}"}
     except httpx.HTTPError as e:
-        logger.error("HTTP client error: %s", str(e))
+        logger.error("HTTP client error: %s", _redact(str(e)))
         return {"error": True, "message": f"HTTP client error: {str(e)}"}
 
 
@@ -246,7 +246,7 @@ def _handle_http_status_error(e: httpx.HTTPStatusError) -> dict[str, Any]:
     """
     error_code = e.response.status_code
     error_text = e.response.text
-    logger.error("HTTP error: %s - %s", error_code, error_text)
+    logger.error("HTTP error: %s - %s", error_code, _redact(error_text))
     return {
         "error": True,
         "status_code": error_code,

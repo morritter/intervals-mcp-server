@@ -97,7 +97,9 @@ def test_get_coach_report_validates_input(monkeypatch):
     calls = _fake_api(monkeypatch)
     assert asyncio.run(get_coach_report(days=3)).startswith("Error: days must be between 7 and 90")
     assert asyncio.run(get_coach_report(days=91)).startswith("Error: days must be between 7 and 90")
-    assert asyncio.run(get_coach_report(end_date="27.09.2026")).startswith("Error: Invalid date format")
+    for bad_date in ("27.09.2026", "2026-9-7", "2026-02-30", "2026-W39-1", "9999-12-31", "0001-01-01", "2026-09-27/../x"):
+        result = asyncio.run(get_coach_report(end_date=bad_date))
+        assert result.startswith("Error: end_date must be a valid date in YYYY-MM-DD format"), bad_date
     assert not calls
 
 
