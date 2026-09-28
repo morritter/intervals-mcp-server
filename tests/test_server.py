@@ -133,21 +133,29 @@ def test_get_event_by_id(monkeypatch):
     """
     event = {
         "id": "e1",
-        "date": "2024-01-01",
+        "start_date_local": "2024-01-01T00:00:00",
+        "category": "WORKOUT",
+        "type": "Ride",
+        "icu_training_load": 79,
+        "moving_time": 7200,
         "name": "Test Event",
         "description": "desc",
-        "race": True,
     }
+    urls = []
 
-    async def fake_request(*_args, **_kwargs):
+    async def fake_request(url=None, **_kwargs):
+        urls.append(url)
         return event
 
     # Patch in both api.client and tools modules to ensure it works
     monkeypatch.setattr("intervals_mcp_server.api.client.make_intervals_request", fake_request)
     monkeypatch.setattr("intervals_mcp_server.tools.events.make_intervals_request", fake_request)
     result = asyncio.run(get_event_by_id("e1", athlete_id="1"))
+    assert urls == ["/athlete/1/events/e1"]
     assert "Event Details:" in result
     assert "Test Event" in result
+    assert "Sport: Ride" in result
+    assert "Planned load: 79" in result
 
 
 def test_get_wellness_data(monkeypatch):

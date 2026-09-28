@@ -179,6 +179,32 @@ def test_format_event_details():
     details = format_event_details(event)
     assert "Event Details:" in details
     assert "Workout Information:" in details
+    assert "Race Information:" not in details  # races are detected via category only
+
+
+def test_format_event_details_planning_fields_and_race():
+    """
+    Test that format_event_details shows category, sport, planned load and time,
+    and detects races from the RACE_A/B/C category.
+    """
+    event = {
+        "id": 139039499,
+        "start_date_local": "2026-10-25T00:00:00",
+        "category": "RACE_B",
+        "type": "Ride",
+        "icu_training_load": 245,
+        "moving_time": 18000,
+        "name": "Gravel race",
+        "description": None,
+    }
+    details = format_event_details(event)
+    assert "Date: 2026-10-25T00:00:00" in details
+    assert "Category: RACE_B" in details
+    assert "Sport: Ride" in details
+    assert "Planned load: 245" in details
+    assert "Planned time: 300 min" in details
+    assert "Description: No description" in details
+    assert "Race Information:\nPriority: B" in details
 
 
 def test_format_intervals():
