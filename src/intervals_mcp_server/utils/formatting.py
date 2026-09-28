@@ -433,20 +433,25 @@ def _event_planning_lines(event: dict[str, Any]) -> list[str]:
 
 
 def format_event_summary(event: dict[str, Any]) -> str:
-    """Format a basic event summary into a readable string."""
+    """Format a basic event summary into a readable string.
+
+    The event list of the API has no ``workout`` object, so sport and planning data
+    come from ``type``, ``icu_training_load`` and ``moving_time`` (see
+    :func:`_event_planning_lines`).
+    """
 
     # Update to check for "date" if "start_date_local" is not provided
-    event_date = event.get("start_date_local", event.get("date", "Unknown"))
-    event_type = "Workout" if event.get("workout") else "Race" if event.get("race") else "Other"
-    event_name = event.get("name", "Unnamed")
-    event_id = event.get("id", "N/A")
-    event_desc = event.get("description", "No description")
-
-    return f"""Date: {event_date}
-ID: {event_id}
-Type: {event_type}
-Name: {event_name}
-Description: {event_desc}"""
+    lines = [
+        f"Date: {event.get('start_date_local', event.get('date', 'Unknown'))}",
+        f"ID: {event.get('id', 'N/A')}",
+        *_event_planning_lines(event),
+    ]
+    priority = _race_priority(event)
+    if priority:
+        lines.append(f"Race priority: {priority}")
+    lines.append(f"Name: {event.get('name', 'Unnamed')}")
+    lines.append(f"Description: {event.get('description') or 'No description'}")
+    return "\n".join(lines)
 
 
 def format_event_details(event: dict[str, Any]) -> str:

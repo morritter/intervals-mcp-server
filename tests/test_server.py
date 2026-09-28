@@ -109,11 +109,14 @@ def test_get_events(monkeypatch):
     Test get_events returns a formatted string containing event details when given a sample event.
     """
     event = {
-        "date": "2024-01-01",
+        "start_date_local": "2024-01-01T00:00:00",
         "id": "e1",
+        "category": "WORKOUT",
+        "type": "Ride",
+        "icu_training_load": 79,
+        "moving_time": 7200,
         "name": "Test Event",
         "description": "desc",
-        "race": True,
     }
 
     async def fake_request(*_args, **_kwargs):
@@ -125,6 +128,9 @@ def test_get_events(monkeypatch):
     result = asyncio.run(get_events(athlete_id="1", start_date="2024-01-01", end_date="2024-01-02"))
     assert "Test Event" in result
     assert "Events:" in result
+    assert "Sport: Ride" in result
+    assert "Planned time: 120 min" in result
+    assert "Type: Other" not in result
 
 
 def test_get_event_by_id(monkeypatch):
