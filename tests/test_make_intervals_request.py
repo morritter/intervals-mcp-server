@@ -99,3 +99,14 @@ def test_make_intervals_request_bad_json(monkeypatch, caplog):
 
     assert result["error"] is True
     assert "Invalid JSON in response" in result["message"]
+
+
+def test_athlete_id_is_redacted_in_logged_urls():
+    """
+    Test that logged URLs never contain the athlete ID and httpx request logging is silenced.
+    """
+    redact = api_client._redact  # pylint: disable=protected-access
+    assert redact("/athlete/i12345/activities") == "/athlete/***/activities"
+    assert redact("https://intervals.icu/api/v1/athlete/i12345?x=1") == "https://intervals.icu/api/v1/athlete/***?x=1"
+    assert redact("/activity/i999/intervals") == "/activity/i999/intervals"
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
