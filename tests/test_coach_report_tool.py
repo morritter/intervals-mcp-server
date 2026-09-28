@@ -2,6 +2,8 @@
 Tests for the get_coach_report MCP tool with a mocked Intervals.icu API (no network).
 """
 
+# pylint: disable=missing-function-docstring
+
 import asyncio
 import json
 import os

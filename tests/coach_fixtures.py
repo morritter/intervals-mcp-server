@@ -23,7 +23,7 @@ def power_zones(*secs: float, sweet_spot: float = 0.0) -> list[dict[str, Any]]:
     return zones
 
 
-def activity(  # pylint: disable=too-many-arguments
+def activity(  # pylint: disable=too-many-arguments,too-many-locals
     day: date,
     type_: str = "Ride",
     *,

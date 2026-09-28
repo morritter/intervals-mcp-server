@@ -9,6 +9,8 @@ model only has to interpret, not calculate.
 All thresholds and mappings live in :class:`CoachConfig`.
 """
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import math
@@ -260,7 +262,7 @@ def wellness_by_day(wellness: Any) -> dict[date, WellnessRecord]:
 # ---------------------------------------------------------------------------
 
 
-def load_metrics(
+def load_metrics(  # pylint: disable=too-many-locals
     activities: list[Activity], end: date, config: CoachConfig = DEFAULT_CONFIG
 ) -> dict[str, Any]:
     """Acute/chronic load, ACWR, Foster monotony and strain, primary-sport monotony, deload.
@@ -328,7 +330,7 @@ def load_metrics(
     }
 
 
-def fitness_status(
+def fitness_status(  # pylint: disable=too-many-locals
     wellness: dict[date, WellnessRecord], activities: list[Activity], end: date
 ) -> dict[str, Any]:
     """CTL, ATL, TSB (= CTL - ATL) and ramp rate at the end date.
@@ -398,7 +400,7 @@ def iso_week_label(day: date) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
-def weekly_volume(
+def weekly_volume(  # pylint: disable=too-many-locals
     activities: list[Activity], end: date, days: int, config: CoachConfig = DEFAULT_CONFIG
 ) -> list[dict[str, Any]]:
     """Per ISO week (Mon-Sun) and sport family: hours, load, sessions, km.
@@ -490,7 +492,7 @@ def _valid_hrv(record: WellnessRecord, config: CoachConfig) -> float | None:
     return value
 
 
-def hrv_status(
+def hrv_status(  # pylint: disable=too-many-locals
     wellness: dict[date, WellnessRecord], end: date, config: CoachConfig = DEFAULT_CONFIG
 ) -> dict[str, Any]:
     """HRV trend: 7-day mean of ln(rMSSD) vs. the baseline normal range.
@@ -737,7 +739,7 @@ def classify_tid(
     return "Pyramidal"
 
 
-def intensity_distribution(
+def intensity_distribution(  # pylint: disable=too-many-locals
     activities: list[Activity], config: CoachConfig = DEFAULT_CONFIG, family: str | None = None
 ) -> dict[str, Any]:
     """3-zone distribution, polarization index and TID class over the given activities.
@@ -843,7 +845,9 @@ def is_hard_day(day_activities: list[Activity], config: CoachConfig = DEFAULT_CO
 # ---------------------------------------------------------------------------
 
 
-def _durability_exclusion(activity: Activity, family: str, config: CoachConfig) -> str | None:
+def _durability_exclusion(  # pylint: disable=too-many-return-statements
+    activity: Activity, family: str, config: CoachConfig
+) -> str | None:
     """First failed quality criterion for a decoupling value, or None if it qualifies.
 
     Reasons (limits from ``config``): ``short`` (moving time too short), ``pauses``
@@ -871,7 +875,7 @@ def _durability_exclusion(activity: Activity, family: str, config: CoachConfig) 
     return None
 
 
-def durability(
+def durability(  # pylint: disable=too-many-locals
     activities: list[Activity], end: date, days: int, config: CoachConfig = DEFAULT_CONFIG
 ) -> dict[str, Any]:
     """Aerobic decoupling (Pa:HR / Pace:HR drift, %) of steady long sessions.

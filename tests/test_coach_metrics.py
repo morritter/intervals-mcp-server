@@ -2,6 +2,8 @@
 Unit tests for the pure coach_metrics module (no network).
 """
 
+# pylint: disable=missing-function-docstring
+
 import json
 import math
 import pathlib
@@ -64,7 +66,7 @@ def test_wellness_by_day_accepts_list_and_dict():
     record = wellness(END)
     assert cm.wellness_by_day([record])[END] is record
     assert END in cm.wellness_by_day({END.isoformat(): {"hrv": 70}})
-    assert cm.wellness_by_day(None) == {}
+    assert not cm.wellness_by_day(None)
 
 
 def test_iso_week_label_crosses_year_boundary():
