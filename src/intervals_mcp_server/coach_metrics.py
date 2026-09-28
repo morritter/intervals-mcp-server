@@ -98,10 +98,12 @@ class CoachConfig:  # pylint: disable=too-many-instance-attributes
     pi_z3_min: float = 0.01
     pi_polarized_min: float = 2.0
     # Hard-day ladders: (lowest zone, minimum seconds at or above that zone).
-    # Power per Seiler/Foster; HR is coarser and lags, so only sustained work
-    # above LT2 counts (Section 11).
+    # Power per Seiler/Foster, but with 60 instead of 30 min for Z3+: on hilly
+    # endurance rides 30 min of incidental tempo is common and should not make the
+    # day hard. HR is coarser and lags, so only sustained work above LT2 counts
+    # (Section 11).
     hard_day_power_ladder: tuple[tuple[int, int], ...] = (
-        (3, 1800),
+        (3, 3600),
         (4, 600),
         (5, 300),
         (6, 120),
@@ -109,21 +111,24 @@ class CoachConfig:  # pylint: disable=too-many-instance-attributes
     )
     hard_day_hr_ladder: tuple[tuple[int, int], ...] = ((4, 600), (5, 300))
 
-    # Durability (aerobic decoupling) quality filter
+    # Durability (aerobic decoupling) quality filter. VI and pause limits are set
+    # for hilly outdoor riding (typical VI 1.1-1.3, cafe stops); stricter values
+    # (VI 1.10, 0.9) excluded every ride of the reference athlete.
     durability_ride_types: tuple[str, ...] = ("Ride", "VirtualRide")
     durability_run_types: tuple[str, ...] = ("Run",)
     durability_min_moving_s: int = 3600
-    durability_max_vi: float = 1.10
-    durability_min_moving_ratio: float = 0.9
+    durability_max_vi: float = 1.20
+    durability_min_moving_ratio: float = 0.85
     durability_max_temp_c: float = 25.0
     durability_high_drift_pct: float = 5.0
     durability_high_drift_count_7d: int = 3
     durability_trend_band_pct: float = 1.0
     durability_min_sessions_trend: int = 2
 
-    # Efficiency factor (NP / avg HR), steady cycling only
+    # Efficiency factor (NP / avg HR) of reasonably steady rides; VI 1.05 (Section 11)
+    # leaves no outdoor ride in hilly terrain, so the durability VI limit is used.
     ef_types: tuple[str, ...] = ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide")
-    ef_max_vi: float = 1.05
+    ef_max_vi: float = 1.20
     ef_min_moving_s: int = 1200
     ef_min_sessions: int = 2
     ef_trend_band: float = 0.03
@@ -841,10 +846,10 @@ def is_hard_day(day_activities: list[Activity], config: CoachConfig = DEFAULT_CO
 def _durability_exclusion(activity: Activity, family: str, config: CoachConfig) -> str | None:
     """First failed quality criterion for a decoupling value, or None if it qualifies.
 
-    Reasons: ``short`` (< 60 min moving), ``pauses`` (moving/elapsed < 0.9),
-    ``heat`` (avg temperature > 25 degC; a missing temperature, e.g. indoors, passes),
-    ``no_power`` (ride without VI), ``vi`` (VI > 1.10; runs without power skip this
-    check), ``no_decoupling`` (value missing).
+    Reasons (limits from ``config``): ``short`` (moving time too short), ``pauses``
+    (moving/elapsed too low), ``heat`` (avg temperature too high; a missing
+    temperature, e.g. indoors, passes), ``no_power`` (ride without VI), ``vi`` (VI too
+    high; runs without power skip this check), ``no_decoupling`` (value missing).
     """
     moving = _num(activity.get("moving_time")) or 0.0
     if moving < config.durability_min_moving_s:
@@ -935,8 +940,8 @@ def efficiency_factor(
 ) -> dict[str, Any]:
     """Mean efficiency factor (NP / avg HR) of steady rides, 7 vs. 28 days.
 
-    Qualifying: cycling type, ``icu_efficiency_factor`` present, 0 < VI <= 1.05 and
-    at least 20 min moving. Each mean needs ``ef_min_sessions`` values. Trend:
+    Qualifying: cycling type, ``icu_efficiency_factor`` present, 0 < VI <=
+    ``ef_max_vi`` and at least ``ef_min_moving_s`` moving. Each mean needs ``ef_min_sessions`` values. Trend:
     7-day minus 28-day mean, +/- ``ef_trend_band`` = stable; rising = better aerobic
     efficiency.
     """

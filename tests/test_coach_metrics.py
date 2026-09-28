@@ -423,7 +423,9 @@ def test_tid_drift_without_data():
 def test_hard_day_ladders():
     easy = activity(END, zones=power_zones(3600, 3600, 1200, 300, 0, 0, 0))
     assert cm.is_hard_day([easy]) is False
-    tempo = activity(END, zones=power_zones(3600, 0, 1800, 0, 0, 0, 0))
+    incidental_tempo = activity(END, zones=power_zones(3600, 0, 1800, 0, 0, 0, 0))
+    assert cm.is_hard_day([incidental_tempo]) is False
+    tempo = activity(END, zones=power_zones(3600, 0, 3000, 600, 0, 0, 0))
     assert cm.is_hard_day([tempo]) is True
     sprints = activity(END, zones=power_zones(3600, 0, 0, 0, 0, 0, 60))
     assert cm.is_hard_day([sprints]) is True
@@ -465,7 +467,7 @@ def test_durability_exclusion_reasons():
         _steady_ride(END, elapsed=9000),  # pauses
         _steady_ride(END, temp=28.0),  # heat
         _steady_ride(END, vi=None),  # no_power
-        _steady_ride(END, vi=1.2),  # vi
+        _steady_ride(END, vi=1.3),  # vi
         _steady_ride(END, decoupling=None),  # no_decoupling
         activity(END, "WeightTraining", moving=3600),  # not considered at all
         activity(END, "GravelRide", moving=7200),  # not a durability type
@@ -515,7 +517,7 @@ def test_durability_negative_decoupling_kept():
 def test_efficiency_factor_trend():
     acts = [activity(days_before(END, offset), vi=1.02, ef=1.80, moving=3600) for offset in (10, 15, 20)]
     acts += [activity(days_before(END, offset), vi=1.02, ef=1.90, moving=3600) for offset in (1, 3)]
-    acts.append(activity(END, vi=1.2, ef=2.5))  # not steady
+    acts.append(activity(END, vi=1.3, ef=2.5))  # not steady
     acts.append(activity(END, vi=1.0, ef=2.5, moving=600))  # too short
     acts.append(activity(END, "Run", vi=1.0, ef=2.5))  # not cycling
     result = cm.efficiency_factor(acts, END)
