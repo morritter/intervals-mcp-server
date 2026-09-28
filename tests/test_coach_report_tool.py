@@ -7,7 +7,7 @@ import json
 import os
 import pathlib
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("API_KEY", "test")
@@ -46,7 +46,7 @@ def test_get_coach_report_returns_compact_json(monkeypatch):
     assert len(result.encode("utf-8")) < 4096
     assert " " not in result.split('"code"')[0]  # compact separators
     params = {url.rsplit("/", 1)[-1]: p for url, p in calls}
-    assert params["activities"] == {"oldest": "2026-08-31", "newest": "2026-09-28"}
+    assert params["activities"] == {"oldest": "2026-08-30", "newest": "2026-09-28"}
     assert params["wellness"] == {"oldest": "2026-07-30", "newest": "2026-09-27"}
     assert all("i1" in url for url, _ in calls)
 
@@ -57,7 +57,7 @@ def test_get_coach_report_short_window_still_fetches_fixed_windows(monkeypatch):
     assert report["period"]["days"] == 7
     assert len(report["volume"]) == 1
     params = {url.rsplit("/", 1)[-1]: p for url, p in calls}
-    assert params["activities"]["oldest"] == "2026-08-31"
+    assert params["activities"]["oldest"] == "2026-08-30"
 
 
 def test_get_coach_report_default_end_uses_athlete_timezone(monkeypatch):
@@ -65,7 +65,26 @@ def test_get_coach_report_default_end_uses_athlete_timezone(monkeypatch):
     monkeypatch.setattr(tool_module, "_athlete_today", lambda athlete: END)
     report = json.loads(asyncio.run(get_coach_report()))
     assert report["period"]["end"] == END.isoformat()
+    assert report["period"]["load_end"] == END.isoformat()  # END already has an activity
     assert report["period"]["days"] == 28
+
+
+def test_get_coach_report_morning_without_activity_ends_load_yesterday(monkeypatch):
+    _fake_api(monkeypatch)
+    today = END + timedelta(days=1)  # Monday, no activity recorded yet
+    monkeypatch.setattr(tool_module, "_athlete_today", lambda athlete: today)
+    report = json.loads(asyncio.run(get_coach_report()))
+    assert report["period"]["end"] == today.isoformat()
+    assert report["period"]["load_end"] == END.isoformat()
+    assert report["period"]["start"] == "2026-08-31"
+    assert [week["week"] for week in report["volume"]][-1] == "2026-W39"
+
+
+def test_get_coach_report_explicit_end_date_is_not_shifted(monkeypatch):
+    _fake_api(monkeypatch)
+    today = END + timedelta(days=1)
+    report = json.loads(asyncio.run(get_coach_report(end_date=today.isoformat())))
+    assert report["period"]["load_end"] == today.isoformat()
 
 
 def test_athlete_today_timezone_handling():

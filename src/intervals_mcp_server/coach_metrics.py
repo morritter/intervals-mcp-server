@@ -1267,6 +1267,20 @@ def _zone_map_label(mapping: tuple[int, ...]) -> str:
     return "|".join(groups)
 
 
+def default_load_end(activities: Any, today: date) -> date:
+    """Last day to include in load windows when the report ends today.
+
+    Returns ``today`` once an activity is recorded for today, otherwise yesterday:
+    a morning report would otherwise count today as a rest day and understate the
+    7-day load, ACWR and the current week.
+    """
+    if isinstance(activities, list):
+        for activity in activities:
+            if isinstance(activity, dict) and activity_day(activity) == today:
+                return today
+    return today - timedelta(days=1)
+
+
 def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     activities: Any,
     wellness: Any,
@@ -1274,35 +1288,44 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
     end: date,
     days: int,
     config: CoachConfig = DEFAULT_CONFIG,
+    load_end: date | None = None,
 ) -> dict[str, Any]:
     """Assemble the complete coach report from raw Intervals.icu data.
 
     Args:
-        activities: activity dicts covering at least ``max(days, 28)`` days up to ``end``.
+        activities: activity dicts covering at least ``max(days, 28)`` days up to
+            ``load_end``.
         wellness: wellness records (list or date-keyed dict) covering at least
             ``max(days, 60)`` days up to ``end``.
         athlete: the athlete record (for sport settings).
-        end: last day of the report (inclusive).
+        end: report date (inclusive). Recovery, CTL/ATL/TSB, eFTP and inactivity
+            flags are evaluated on this day.
         days: length of the report window in days.
         config: thresholds and mappings.
+        load_end: last day of the load-based windows (volume, ACWR, monotony,
+            intensity, durability, EF, top sessions); defaults to ``end`` and is
+            capped at ``end``. See :func:`default_load_end`.
 
     Returns:
         A JSON-serialisable dict with fixed keys and ``schema_version``.
     """
     if days < 1:
         raise ValueError("days must be at least 1")
+    load_end = end if load_end is None else min(load_end, end)
     acts = [a for a in activities if isinstance(a, dict)] if isinstance(activities, list) else []
     acts = [a for a in acts if (day := activity_day(a)) is not None and day <= end]
+    load_acts = [a for a in acts if (day := activity_day(a)) is not None and day <= load_end]
     well = wellness_by_day(wellness)
     athlete_record = athlete if isinstance(athlete, dict) else {}
-    start = end - timedelta(days=days - 1)
-    window_acts = activities_between(acts, start, end)
+    start = load_end - timedelta(days=days - 1)
+    window_acts = activities_between(acts, start, load_end)
 
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "period": {
             "start": start.isoformat(),
             "end": end.isoformat(),
+            "load_end": load_end.isoformat(),
             "days": days,
             "windows": {
                 "acute": config.acute_days,
@@ -1311,13 +1334,13 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
             },
         },
         "flags": [],
-        "load": {**fitness_status(well, acts, end), **load_metrics(acts, end, config)},
+        "load": {**fitness_status(well, acts, end), **load_metrics(load_acts, load_end, config)},
         "recovery": {
             "hrv": hrv_status(well, end, config),
             "rhr": rhr_status(well, end, config),
             "sleep": sleep_summary(well, end, days, config),
         },
-        "volume": weekly_volume(acts, end, days, config),
+        "volume": weekly_volume(load_acts, load_end, days, config),
         "intensity": {
             "map": {
                 "power": _zone_map_label(config.power_zone_map),
@@ -1325,11 +1348,11 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
             },
             "all": intensity_distribution(window_acts, config),
             "rad": intensity_distribution(window_acts, config, RAD),
-            "drift": tid_drift(acts, end, config),
+            "drift": tid_drift(load_acts, load_end, config),
         },
         "capability": {
-            "durability": durability(acts, end, days, config),
-            "ef": efficiency_factor(acts, end, config),
+            "durability": durability(load_acts, load_end, days, config),
+            "ef": efficiency_factor(load_acts, load_end, config),
             "eftp": eftp_trend(well, end, config),
         },
         "top_sessions": top_sessions(window_acts, config),

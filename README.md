@@ -279,7 +279,7 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - **Flags**: rule-based hints with severity (for example FTP vs. eFTP deviation, ACWR, monotony, HRV below its normal range, short sleep, missing RPE/feel)
 - **Coverage**: how many days and sessions have HRV, sleep and zone data
 
-The athlete ID and API key are read from the environment only. The default end date is today in the athlete's time zone.
+The athlete ID and API key are read from the environment only. The default end date is today in the athlete's time zone; until the first activity of the day is recorded, the load-based sections end yesterday (`period.load_end`) so a morning report does not count today as a rest day. Recovery and CTL/ATL/TSB always refer to the report date.
 
 ## Usage with ChatGPT
 

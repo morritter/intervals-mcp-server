@@ -753,7 +753,7 @@ def test_report_structure_and_size():
     assert list(report) == REPORT_KEYS
     assert report["schema_version"] == cm.SCHEMA_VERSION
     assert report["period"] == {
-        "start": "2026-08-31", "end": "2026-09-27", "days": 28,
+        "start": "2026-08-31", "end": "2026-09-27", "load_end": "2026-09-27", "days": 28,
         "windows": {"acute": 7, "chronic": 28, "baseline": 60},
     }
     assert len(report["volume"]) == 4
@@ -783,3 +783,29 @@ def test_report_ignores_activities_after_end_and_bad_input():
     assert report["load"]["load_7d"] == 0
     with pytest.raises(ValueError):
         cm.build_coach_report([], [], {}, END, 0)
+
+
+def test_default_load_end():
+    assert cm.default_load_end([activity(END)], END) == END
+    assert cm.default_load_end([activity(days_before(END, 1))], END) == days_before(END, 1)
+    assert cm.default_load_end(None, END) == days_before(END, 1)
+
+
+def test_load_end_excludes_untrained_today_from_load_but_not_recovery():
+    acts = [activity(days_before(END, offset), load=100) for offset in range(1, 40)]
+    records = [wellness(days_before(END, offset)) for offset in range(60)]
+    records[0] = wellness(END, hrv=50.0, sleep_h=5.0)  # today's morning values
+    today_included = cm.build_coach_report(acts, records, {}, END, 28)
+    shifted = cm.build_coach_report(acts, records, {}, END, 28, load_end=days_before(END, 1))
+    assert today_included["load"]["load_7d"] == 600
+    assert shifted["load"]["load_7d"] == 700
+    assert shifted["load"]["acwr"] == 1.0
+    assert shifted["period"]["load_end"] == days_before(END, 1).isoformat()
+    assert shifted["period"]["start"] == days_before(END, 28).isoformat()
+    assert shifted["recovery"]["sleep"]["recent_h"][-1] == 5.0
+    assert shifted["recovery"] == today_included["recovery"]
+
+
+def test_load_end_is_capped_at_end():
+    report = cm.build_coach_report([], [], {}, END, 7, load_end=END + (END - days_before(END, 3)))
+    assert report["period"]["load_end"] == END.isoformat()

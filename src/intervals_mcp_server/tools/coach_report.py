@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from intervals_mcp_server.api.client import make_intervals_request
-from intervals_mcp_server.coach_metrics import DEFAULT_CONFIG, build_coach_report
+from intervals_mcp_server.coach_metrics import DEFAULT_CONFIG, build_coach_report, default_load_end
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.validation import validate_date
 
@@ -44,7 +44,8 @@ def _error_message(result: Any) -> str | None:
 
 
 async def _fetch_activities(athlete_id: str, end: date, days: int) -> Any:
-    oldest = end - timedelta(days=max(days, DEFAULT_CONFIG.chronic_days) - 1)
+    # One extra day so the load windows still fit if they end the day before ``end``.
+    oldest = end - timedelta(days=max(days, DEFAULT_CONFIG.chronic_days))
     # newest is padded by one day; activities after the end date are dropped later.
     params = {"oldest": oldest.isoformat(), "newest": (end + timedelta(days=1)).isoformat()}
     return await make_intervals_request(url=f"/athlete/{athlete_id}/activities", params=params)
@@ -70,8 +71,11 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
     Args:
         days: Report window in days (7-90, default 28). ACWR/monotony (7 and 28 days)
             and the HRV/RHR baselines (60 days) always use their fixed windows.
-        end_date: Last day of the report, YYYY-MM-DD (default: today in the
-            athlete's time zone).
+        end_date: Report date, YYYY-MM-DD (default: today in the athlete's time
+            zone). With the default, load-based sections (volume, load, intensity,
+            capability, top_sessions) end yesterday until today's first activity is
+            recorded (period.load_end), so an untrained morning does not look like a
+            rest day. Recovery and CTL/ATL/TSB always refer to the report date.
 
     Output keys (schema_version 1.0); null always means "not enough data", never 0:
     - flags: rule-based hints {code, sev: alarm|warning|info, val, thr}, most
@@ -114,6 +118,7 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
     if not athlete_id:
         return "Error: No ATHLETE_ID found in environment variables."
 
+    use_default_end = end is None
     if end is None:
         athlete = await make_intervals_request(url=f"/athlete/{athlete_id}")
         if (message := _error_message(athlete)) is not None:
@@ -136,5 +141,6 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
     if (message := _error_message(wellness)) is not None:
         return f"Error fetching wellness data: {message}"
 
-    report = build_coach_report(activities, wellness, athlete, end, days)
+    load_end = default_load_end(activities, end) if use_default_end else end
+    report = build_coach_report(activities, wellness, athlete, end, days, load_end=load_end)
     return json.dumps(report, separators=(",", ":"), ensure_ascii=False)
