@@ -570,6 +570,18 @@ def test_athlete_thresholds():
     assert cm.athlete_thresholds({}) == {"ftp": None, "ftp_indoor": None, "lthr_rad": None, "lthr_lauf": None}
 
 
+def test_athlete_thresholds_use_ftp_of_latest_ride():
+    old_ride = dict(activity(days_before(END, 40)), icu_ftp=320)
+    recent_ride = dict(activity(days_before(END, 3)), icu_ftp=335)
+    indoor = dict(activity(days_before(END, 2), "VirtualRide"), icu_ftp=330)
+    run = dict(activity(END, "Run"), icu_ftp=None)
+    result = cm.athlete_thresholds(athlete(ftp=343, indoor_ftp=340), [old_ride, recent_ride, indoor, run])
+    assert result["ftp"] == 335
+    assert result["ftp_indoor"] == 330
+    only_outdoor = cm.athlete_thresholds(athlete(ftp=343, indoor_ftp=340), [recent_ride])
+    assert only_outdoor["ftp_indoor"] == 340  # falls back to the sport settings
+
+
 def test_intensity_factor_converts_percent():
     assert cm.intensity_factor(activity(END, intensity=56.85)) == pytest.approx(0.5685)
     assert cm.intensity_factor(activity(END, intensity=0.85)) == pytest.approx(0.85)

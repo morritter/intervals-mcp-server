@@ -1045,13 +1045,34 @@ def _sport_setting(athlete: dict[str, Any], activity_type: str) -> dict[str, Any
     return {}
 
 
-def athlete_thresholds(athlete: dict[str, Any]) -> dict[str, Any]:
-    """FTP (outdoor/indoor) and LTHR from the athlete's sport settings."""
+def _ftp_of_latest_ride(activities: list[Activity], types: tuple[str, ...]) -> float | None:
+    """FTP (``icu_ftp``) that was in force on the most recent ride of the given types."""
+    rides = [
+        a for a in activities if a.get("type") in types and (_num(a.get("icu_ftp")) or 0) > 0
+    ]
+    if not rides:
+        return None
+    latest = max(rides, key=lambda a: a.get("start_date_local") or "")
+    return _num(latest.get("icu_ftp"))
+
+
+def athlete_thresholds(
+    athlete: dict[str, Any], activities: list[Activity] | None = None
+) -> dict[str, Any]:
+    """FTP (outdoor/indoor) and LTHR.
+
+    FTP comes from the latest outdoor ride / virtual ride in ``activities`` (the FTP
+    Intervals.icu used at that time, so reports for past dates compare eFTP with the
+    FTP of that period). Without such rides the current sport settings are used.
+    """
     ride = _sport_setting(athlete, "Ride")
     run = _sport_setting(athlete, "Run")
+    rides = activities or []
+    outdoor_ftp = _ftp_of_latest_ride(rides, ("Ride", "GravelRide", "MountainBikeRide"))
+    indoor_ftp = _ftp_of_latest_ride(rides, ("VirtualRide",))
     return {
-        "ftp": _r(_num(ride.get("ftp")), 0),
-        "ftp_indoor": _r(_num(ride.get("indoor_ftp")), 0),
+        "ftp": _r(outdoor_ftp or _num(ride.get("ftp")), 0),
+        "ftp_indoor": _r(indoor_ftp or _num(ride.get("indoor_ftp")), 0),
         "lthr_rad": _r(_num(ride.get("lthr")), 0),
         "lthr_lauf": _r(_num(run.get("lthr")), 0),
     }
@@ -1356,7 +1377,7 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
             "eftp": eftp_trend(well, end, config),
         },
         "top_sessions": top_sessions(window_acts, config),
-        "thresholds": athlete_thresholds(athlete_record),
+        "thresholds": athlete_thresholds(athlete_record, load_acts),
         "coverage": coverage(window_acts, well, end, days, config),
     }
     report["flags"] = build_flags(

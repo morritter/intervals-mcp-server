@@ -269,7 +269,7 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 
 #### Coach report
 
-`get_coach_report(days=28, end_date=None)` returns a compact JSON report (typically under 4 KB) so the LLM interprets numbers instead of calculating them from raw activities. All metrics are computed deterministically in `src/intervals_mcp_server/coach_metrics.py`, a pure module without network access. All thresholds live in its `CoachConfig` dataclass.
+`get_coach_report(days=28, end_date=None)` returns a compact JSON report (about 3.3 KB for the default 28 days; each additional week adds roughly 150 bytes) so the LLM interprets numbers instead of calculating them from raw activities. All metrics are computed deterministically in `src/intervals_mcp_server/coach_metrics.py`, a pure module without network access. All thresholds live in its `CoachConfig` dataclass.
 
 - **Volume**: hours, load, sessions and km per ISO week and sport family (Ride and VirtualRide are merged as "Rad"), rest days, hard days, weekly monotony
 - **Load**: CTL, ATL, TSB and ramp rate at the end date, ACWR (7 d / 28 d), Foster monotony and strain, primary-sport monotony for multi-sport athletes, deload detection
