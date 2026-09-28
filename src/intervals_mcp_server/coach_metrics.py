@@ -158,7 +158,7 @@ def _r(value: float | None, digits: int = 1) -> float | int | None:
         return None
     if digits == 0:
         return int(round(value))
-    return round(value, digits)
+    return round(value, digits) + 0.0  # + 0.0 turns -0.0 into 0.0
 
 
 def parse_day(value: Any) -> date | None:

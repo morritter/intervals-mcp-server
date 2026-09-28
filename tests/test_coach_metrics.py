@@ -31,6 +31,12 @@ def test_sport_family_merges_ride_types():
     assert cm.sport_family(None) == cm.SONSTIGE
 
 
+def test_rounding_avoids_negative_zero():
+    assert str(cm._r(-0.04, 1)) == "0.0"  # pylint: disable=protected-access
+    assert cm._r(-0.04, 0) == 0  # pylint: disable=protected-access
+    assert cm._r(None) is None  # pylint: disable=protected-access
+
+
 def test_daily_loads_zero_fills_days_without_training():
     acts = [activity(END, load=50), activity(END, load=30, hour=18), activity(days_before(END, 2), load=20)]
     assert cm.daily_loads(acts, END, 4) == [0.0, 20.0, 0.0, 80.0]
