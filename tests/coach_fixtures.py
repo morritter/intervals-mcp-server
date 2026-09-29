@@ -5,10 +5,15 @@ Field names mirror the real API (activities, wellness, athlete). Values are made
 no athlete IDs or API keys appear here.
 """
 
+import itertools
+import math
 from datetime import date, timedelta
 from typing import Any
 
 END = date(2026, 9, 27)  # a Sunday, so 28 days = exactly 4 ISO weeks
+TODAY = END + timedelta(days=1)  # Monday morning of 2026-W40, nothing recorded yet
+
+_EVENT_IDS = itertools.count(1000)
 
 
 def day_str(day: date, hour: int = 9) -> str:
@@ -100,6 +105,27 @@ def athlete(ftp: int = 343, indoor_ftp: int | None = None) -> dict[str, Any]:
     }
 
 
+def event(  # pylint: disable=too-many-arguments
+    day: date,
+    type_: str | None = "Ride",
+    *,
+    category: str = "WORKOUT",
+    load: float | None = 80,
+    moving: float | None = 3600,
+    name: str = "Planned",
+) -> dict[str, Any]:
+    """Build one calendar event like ``GET /athlete/{id}/events``."""
+    return {
+        "id": next(_EVENT_IDS),
+        "start_date_local": f"{day.isoformat()}T00:00:00",
+        "category": category,
+        "type": type_,
+        "name": name,
+        "icu_training_load": load,
+        "moving_time": moving,
+    }
+
+
 def days_before(end: date, offset: int) -> date:
     """Day ``offset`` days before ``end``."""
     return end - timedelta(days=offset)
@@ -175,3 +201,52 @@ def realistic_scenario(end: date = END) -> tuple[list[dict[str, Any]], list[dict
         for offset in range(60)
     ]
     return activities, records, athlete()
+
+
+def projection_scenario() -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]
+]:
+    """Morning of TODAY: realistic history up to END, 2026-W40 only planned.
+
+    Mirrors a real planned week (bikepacking Thu-Sat). Wellness days after TODAY
+    carry the Intervals.icu projection: CTL/ATL rise only through planned load, and
+    there is no HRV, resting HR or sleep yet. Also contains a note (ignored), a
+    RACE_C inside and a RACE_B after the planned week.
+    """
+    activities, records, athlete_record = realistic_scenario()
+    week = [TODAY + timedelta(days=offset) for offset in range(7)]
+    events = [
+        event(week[0], None, category="NOTE", load=None, moving=None, name="Ruhetag"),
+        event(week[1], "Ride", load=79, moving=7200),
+        event(week[1], "WeightTraining", load=None, moving=1800),
+        event(week[2], "Run", load=56, moving=3768),
+        event(week[3], "Ride", load=211, moving=18000),
+        event(week[4], "Ride", load=211, moving=18000),
+        event(week[5], "Ride", load=211, moving=18000),
+        event(week[6], "VirtualRide", load=49, moving=5400),
+        event(week[6], "WeightTraining", load=None, moving=2400),
+        event(week[6], "Ride", category="RACE_C", load=None, moving=None, name="Club TT"),
+        event(TODAY + timedelta(days=27), "Ride", category="RACE_B", load=None, moving=None, name="Gravel race"),
+    ]
+    planned = {day: sum(e["icu_training_load"] or 0 for e in events if e["category"] == "WORKOUT" and e["start_date_local"].startswith(day.isoformat())) for day in week}
+    ctl_by_day = {days_before(END, offset): 100.0 - offset * 0.05 for offset in range(60)}
+    ctl, atl = ctl_by_day[END], 95.0
+    for day in week:
+        ctl += (planned[day] - ctl) * (1 - math.exp(-1 / 42))
+        atl += (planned[day] - atl) * (1 - math.exp(-1 / 7))
+        ctl_by_day[day] = ctl
+        morning = day == TODAY  # today's morning values exist, future days have none
+        records.append(
+            wellness(
+                day,
+                hrv=80.0 if morning else None,
+                rhr=40.0 if morning else None,
+                sleep_h=7.5 if morning else None,
+                ctl=ctl,
+                atl=atl,
+                ramp=ctl - ctl_by_day[day - timedelta(days=7)],
+                ctl_load=planned[day],
+                eftp=None,
+            )
+        )
+    return activities, records, athlete_record, events

@@ -13,7 +13,12 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from intervals_mcp_server.api.client import make_intervals_request
-from intervals_mcp_server.coach_metrics import DEFAULT_CONFIG, build_coach_report, default_load_end
+from intervals_mcp_server.coach_metrics import (
+    DEFAULT_CONFIG,
+    RACE_CATEGORIES,
+    build_coach_report,
+    default_load_end,
+)
 from intervals_mcp_server.config import get_config
 
 # Import mcp instance from shared module for tool registration
@@ -23,6 +28,7 @@ config = get_config()
 
 MIN_DAYS = 7
 MAX_DAYS = 90
+MAX_PLAN_DAYS = 90
 MIN_END_DATE = date(2000, 1, 1)
 MAX_END_DATE = date(2100, 12, 31)
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -60,18 +66,73 @@ def _error_message(result: Any) -> str | None:
     return None
 
 
-async def _fetch_activities(athlete_id: str, end: date, days: int) -> Any:
-    # One extra day so the load windows still fit if they end the day before ``end``.
-    oldest = end - timedelta(days=max(days, DEFAULT_CONFIG.chronic_days))
+async def _fetch_activities(athlete_id: str, anchor: date, days: int) -> Any:
+    # ``anchor`` = min(end, today): no activities exist after today.
+    # One extra day so the load windows still fit if they end the day before ``anchor``.
+    oldest = anchor - timedelta(days=max(days, DEFAULT_CONFIG.chronic_days))
     # newest is padded by one day; activities after the end date are dropped later.
-    params = {"oldest": oldest.isoformat(), "newest": (end + timedelta(days=1)).isoformat()}
+    params = {"oldest": oldest.isoformat(), "newest": (anchor + timedelta(days=1)).isoformat()}
     return await make_intervals_request(url=f"/athlete/{athlete_id}/activities", params=params)
 
 
-async def _fetch_wellness(athlete_id: str, end: date, days: int) -> Any:
-    oldest = end - timedelta(days=max(days, DEFAULT_CONFIG.baseline_days) - 1)
+async def _fetch_wellness(athlete_id: str, anchor: date, end: date, days: int) -> Any:
+    # Baselines end at ``anchor``; days after it carry the projected CTL/ATL.
+    oldest = anchor - timedelta(days=max(days, DEFAULT_CONFIG.baseline_days) - 1)
     params = {"oldest": oldest.isoformat(), "newest": end.isoformat()}
     return await make_intervals_request(url=f"/athlete/{athlete_id}/wellness", params=params)
+
+
+async def _fetch_plan_events(athlete_id: str, today: date, end: date) -> Any:
+    """Calendar events up to ``end`` plus races within the look-ahead, deduplicated by id.
+
+    Returns the error dict of the first failed request instead.
+    """
+    race_until = max(end, today + timedelta(days=DEFAULT_CONFIG.race_lookahead_days))
+    url = f"/athlete/{athlete_id}/events"
+    results = await asyncio.gather(
+        make_intervals_request(url=url, params={"oldest": today.isoformat(), "newest": end.isoformat()}),
+        make_intervals_request(
+            url=url,
+            params={
+                "oldest": today.isoformat(),
+                "newest": race_until.isoformat(),
+                "category": ",".join(RACE_CATEGORIES),
+            },
+        ),
+    )
+    events: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for result in results:
+        if _error_message(result) is not None:
+            return result
+        for event in result if isinstance(result, list) else []:
+            if not isinstance(event, dict):
+                continue
+            event_id = event.get("id")
+            if event_id is not None:
+                if event_id in seen:
+                    continue
+                seen.add(event_id)
+            events.append(event)
+    return events
+
+
+async def _fetch_report_data(
+    athlete_id: str, today: date, end: date, days: int
+) -> tuple[Any, Any, Any]:
+    """Activities, wellness and (only for an end date after today) calendar events."""
+    anchor = min(end, today)
+    if end <= today:
+        activities, wellness = await asyncio.gather(
+            _fetch_activities(athlete_id, anchor, days),
+            _fetch_wellness(athlete_id, anchor, end, days),
+        )
+        return activities, wellness, None
+    return await asyncio.gather(
+        _fetch_activities(athlete_id, anchor, days),
+        _fetch_wellness(athlete_id, anchor, end, days),
+        _fetch_plan_events(athlete_id, today, end),
+    )
 
 
 @mcp.tool()
@@ -92,16 +153,21 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
             zone). With the default, load-based sections (volume, load, intensity,
             capability, top_sessions) end yesterday until today's first activity is
             recorded (period.load_end), so an untrained morning does not look like a
-            rest day. Recovery and CTL/ATL/TSB always refer to the report date.
+            rest day. Recovery and CTL/ATL/TSB refer to the report date. A future
+            end_date (at most 90 days ahead) gives a projection to check planned
+            weeks, see "Projection mode" below.
 
-    Output keys (schema_version 1.0); null always means "not enough data", never 0:
+    Output keys (schema_version 1.1); null always means "not enough data", never 0:
+    - period: mode (actual, or projection when end_date is after today), start,
+      end, load_end, days.
     - flags: rule-based hints {code, sev: alarm|warning|info, val, thr}, most
       severe first. Start here.
-    - load: ctl, atl, tsb, ramp at the end date (src: api, or
-      recomputed_without_planned when Intervals.icu already counted planned
-      workouts); load_7d, load_28d, acwr, monotony (Foster, 7 days incl. rest
-      days), strain, primary_sport, primary_monotony, effective_monotony
-      (multi-sport corrected, used for flags), deload.
+    - load: ctl, atl, tsb, ramp at the end date. src says what they contain: api
+      (completed training), recomputed_without_planned (today's value without
+      planned but not yet done workouts), api_incl_planned (Intervals.icu
+      projection including planned workouts). load_7d, load_28d, acwr, monotony
+      (Foster, 7 days incl. rest days), strain, primary_sport, primary_monotony,
+      effective_monotony (multi-sport corrected, used for flags), deload.
     - recovery.hrv: 7-day mean of ln(rMSSD) vs. 60-day band (mean +/- 0.5 SD),
       status below|within|above|insufficient_data, days_below (streak).
       recovery.rhr: 7-day vs. 60-day mean, delta (bpm), days_high (streak >= +5).
@@ -121,6 +187,22 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
     - top_sessions: up to 5 notable sessions (highest load, plus the highest IF).
     - thresholds: FTP, indoor FTP, LTHR. coverage: available data (days with
       HRV/RHR/sleep, sessions with power/HR zones, RPE/feel).
+
+    Projection mode (end_date after today): sections from completed training use
+    the `days` up to period.load_end (last completed day); recovery, eftp and
+    coverage refer to today (recovery.as_of). Only then these keys are added:
+    - load.actual: ctl, atl, tsb, ramp today. load.projected: at end_date incl.
+      planned workouts (same as the top-level load values).
+    - plan: from (load_end + 1), to (end_date). weeks per ISO week: load (planned
+      load only; null = Intervals.icu computed no load), h, n, by_sport, rest_days
+      (days without a planned workout), missing_load (workouts without load), ctl
+      and ramp at the week's last day, tsb_min; the current week also has
+      done_load/done_h (completed, never included in load). races: RACE_A/B/C up
+      to 12 weeks ahead. projection: same as load.projected.
+    - every flag has basis: actual (completed data up to today) or projection
+      (plan flags, with week): ramp_planned_high (ramp > 6), tsb_planned_low
+      (tsb_min < -20 warning, < -30 alarm), planned_rest_days_low (fully planned
+      week without rest day).
     """
     if not MIN_DAYS <= days <= MAX_DAYS:
         return f"Error: days must be between {MIN_DAYS} and {MAX_DAYS}."
@@ -137,29 +219,29 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
     if not athlete_id:
         return "Error: No ATHLETE_ID found in environment variables."
 
+    # The athlete comes first: "today" (athlete time zone) decides the mode and windows.
+    athlete = await make_intervals_request(url=f"/athlete/{athlete_id}")
+    if (message := _error_message(athlete)) is not None:
+        return f"Error fetching athlete: {message}"
+    today = _athlete_today(athlete)
     use_default_end = end is None
     if end is None:
-        athlete = await make_intervals_request(url=f"/athlete/{athlete_id}")
-        if (message := _error_message(athlete)) is not None:
-            return f"Error fetching athlete: {message}"
-        end = _athlete_today(athlete)
-        activities, wellness = await asyncio.gather(
-            _fetch_activities(athlete_id, end, days), _fetch_wellness(athlete_id, end, days)
-        )
-    else:
-        athlete, activities, wellness = await asyncio.gather(
-            make_intervals_request(url=f"/athlete/{athlete_id}"),
-            _fetch_activities(athlete_id, end, days),
-            _fetch_wellness(athlete_id, end, days),
-        )
-        if (message := _error_message(athlete)) is not None:
-            return f"Error fetching athlete: {message}"
+        end = today
+    if (end - today).days > MAX_PLAN_DAYS:
+        return f"Error: end_date may be at most {MAX_PLAN_DAYS} days after today ({today.isoformat()})."
 
+    activities, wellness, events = await _fetch_report_data(athlete_id, today, end, days)
     if (message := _error_message(activities)) is not None:
         return f"Error fetching activities: {message}"
     if (message := _error_message(wellness)) is not None:
         return f"Error fetching wellness data: {message}"
+    if (message := _error_message(events)) is not None:
+        return f"Error fetching events: {message}"
 
-    load_end = default_load_end(activities, end) if use_default_end else end
-    report = build_coach_report(activities, wellness, athlete, end, days, load_end=load_end)
+    # An explicit end date up to today is not shifted; the default end date and
+    # projections end the load windows at the last completed day.
+    load_end = default_load_end(activities, today) if use_default_end or end > today else end
+    report = build_coach_report(
+        activities, wellness, athlete, end, days, load_end=load_end, today=today, events=events
+    )
     return json.dumps(report, separators=(",", ":"), ensure_ascii=False)

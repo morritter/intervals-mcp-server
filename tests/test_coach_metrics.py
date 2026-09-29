@@ -174,6 +174,18 @@ def test_fitness_recomputed_when_planned_load_is_counted():
     assert result["ctl"] == round(100.0 * math.exp(-1 / 42), 1)
     assert result["atl"] == round(110.0 * math.exp(-1 / 7), 1)
     assert result["ramp"] == round(100.0 * math.exp(-1 / 42) - 95.0, 1)
+    assert result["ctl"] < 100.0 and result["atl"] < 110.0  # no load -> both fall
+    assert cm.fitness_status(days, [], END, today=END) == result
+
+
+def test_fitness_after_today_is_projection_including_planned():
+    yesterday = days_before(END, 1)
+    days = {
+        yesterday: wellness(yesterday, ctl=100.0, atl=110.0),
+        END: wellness(END, ctl=102.0, atl=120.0, ramp=6.5, ctl_load=150.0),
+    }
+    result = cm.fitness_status(days, [], END, today=yesterday)
+    assert result == {"ctl": 102.0, "atl": 120.0, "tsb": -18.0, "ramp": 6.5, "src": "api_incl_planned"}
 
 
 def test_fitness_not_recomputed_when_load_was_done():
@@ -767,7 +779,7 @@ def test_report_structure_and_size():
     assert list(report) == REPORT_KEYS
     assert report["schema_version"] == cm.SCHEMA_VERSION
     assert report["period"] == {
-        "start": "2026-08-31", "end": "2026-09-27", "load_end": "2026-09-27", "days": 28,
+        "mode": "actual", "start": "2026-08-31", "end": "2026-09-27", "load_end": "2026-09-27", "days": 28,
         "windows": {"acute": 7, "chronic": 28, "baseline": 60},
     }
     assert len(report["volume"]) == 4

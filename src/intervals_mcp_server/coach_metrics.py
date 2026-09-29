@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 Activity = dict[str, Any]
 WellnessRecord = dict[str, Any]
@@ -45,6 +45,10 @@ SPORT_FAMILIES: dict[str, str] = {
     "OpenWaterSwim": SCHWIMMEN,
     "WeightTraining": KRAFT,
 }
+
+# Calendar event categories used by the plan section.
+WORKOUT = "WORKOUT"
+RACE_CATEGORIES: tuple[str, ...] = ("RACE_A", "RACE_B", "RACE_C")
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,13 @@ class CoachConfig:  # pylint: disable=too-many-instance-attributes
 
     # Top sessions
     top_n: int = 5
+
+    # Plan (projection mode): coach rule ramp <= 6 CTL per week
+    ramp_planned_warn: float = 6.0
+    tsb_planned_warn: float = -20.0
+    tsb_planned_alarm: float = -30.0
+    planned_min_rest_days: int = 1
+    race_lookahead_days: int = 84
 
 
 DEFAULT_CONFIG = CoachConfig()
@@ -331,16 +342,22 @@ def load_metrics(  # pylint: disable=too-many-locals
 
 
 def fitness_status(  # pylint: disable=too-many-locals
-    wellness: dict[date, WellnessRecord], activities: list[Activity], end: date
+    wellness: dict[date, WellnessRecord],
+    activities: list[Activity],
+    end: date,
+    today: date | None = None,
 ) -> dict[str, Any]:
     """CTL, ATL, TSB (= CTL - ATL) and ramp rate at the end date.
 
     Uses the Intervals.icu values of the end date, or the last earlier day that has
-    them (reported as ``as_of``). If the end date's ``ctlLoad`` is higher than the
-    load actually completed that day, Intervals.icu has counted planned but not yet
-    done workouts. CTL/ATL are then recomputed from the previous day with the
-    Intervals.icu exponential model (time constants 42 and 7 days) and only the
-    completed load; ramp rate becomes CTL(end) - CTL(end - 7 days).
+    them (reported as ``as_of``). A value after ``today`` is the Intervals.icu
+    projection, which includes planned workouts; it is returned unchanged with
+    ``src`` = ``api_incl_planned``. Otherwise, if the end date's ``ctlLoad`` is
+    higher than the load actually completed that day, Intervals.icu has counted
+    planned but not yet done workouts. CTL/ATL are then recomputed from the
+    previous (completed) day with the Intervals.icu exponential model (time
+    constants 42 and 7 days) and only the completed load; ramp rate becomes
+    CTL(end) - CTL(end - 7 days).
     """
     record_day = None
     for day in days_back(end, 8)[::-1]:
@@ -357,7 +374,9 @@ def fitness_status(  # pylint: disable=too-many-locals
     ramp = _num(record.get("rampRate"))
     source = "api"
 
-    if record_day == end:
+    if today is not None and record_day > today:
+        source = "api_incl_planned"
+    elif record_day == end:
         planned_load = _num(record.get("ctlLoad"))
         done_load = daily_loads(activities, end, 1)[0]
         previous = wellness.get(end - timedelta(days=1), {})
@@ -1274,6 +1293,225 @@ def build_flags(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
 
 
 # ---------------------------------------------------------------------------
+# Plan (projection mode)
+# ---------------------------------------------------------------------------
+
+CalendarEvent = dict[str, Any]
+
+
+def event_day(event: CalendarEvent) -> date | None:
+    """Local calendar day of a calendar event."""
+    return parse_day(event.get("start_date_local"))
+
+
+def event_load(event: CalendarEvent) -> float | None:
+    """Load Intervals.icu computed for a planned event; None if it computed none.
+
+    Unlike :func:`activity_load`, a missing load stays None (e.g. strength sessions
+    without targets) so the report can say so instead of counting it as 0.
+    """
+    load = _num(event.get("icu_training_load"))
+    return max(load, 0.0) if load is not None else None
+
+
+def _collect_plan_events(
+    events: list[CalendarEvent], plan_start: date, end: date, race_until: date
+) -> tuple[dict[date, list[CalendarEvent]], set[date], list[dict[str, Any]]]:
+    """WORKOUT events per day up to ``end``, race days and races up to ``race_until``."""
+    workouts: dict[date, list[CalendarEvent]] = defaultdict(list)
+    race_days: set[date] = set()
+    races = []
+    for event in events:
+        day = event_day(event)
+        if day is None or day < plan_start:
+            continue
+        category = event.get("category")
+        if category == WORKOUT and day <= end:
+            workouts[day].append(event)
+        elif category in RACE_CATEGORIES and day <= race_until:
+            race_days.add(day)
+            races.append({"date": day.isoformat(), "name": event.get("name"), "category": category})
+    return workouts, race_days, sorted(races, key=lambda race: race["date"])
+
+
+def _planned_load(totals: list[dict[str, float]]) -> float | int | None:
+    """Sum of the known loads; None if there are events but none has a load."""
+    if sum(t["n"] for t in totals) > 0 and sum(t["with_load"] for t in totals) == 0:
+        return None
+    return _r(sum(t["load"] for t in totals), 0)
+
+
+def _plan_week(
+    label: str,
+    week_days: list[date],
+    workouts: dict[date, list[CalendarEvent]],
+    race_days: set[date],
+) -> dict[str, Any]:
+    """Planned load, hours and sessions of one ISO week, in total and per sport family."""
+    sports: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"secs": 0.0, "load": 0.0, "n": 0.0, "with_load": 0.0}
+    )
+    for day in week_days:
+        for event in workouts.get(day, []):
+            totals = sports[sport_family(event.get("type"))]
+            totals["secs"] += _num(event.get("moving_time")) or 0.0
+            totals["n"] += 1
+            load = event_load(event)
+            if load is not None:
+                totals["load"] += load
+                totals["with_load"] += 1
+    all_totals = list(sports.values())
+    return {
+        "week": label,
+        "days": len(week_days),
+        "load": _planned_load(all_totals),
+        "h": _r(sum(t["secs"] for t in all_totals) / 3600, 1),
+        "n": int(sum(t["n"] for t in all_totals)),
+        "by_sport": {
+            family: {
+                "load": _planned_load([sports[family]]),
+                "h": _r(sports[family]["secs"] / 3600, 1),
+                "n": int(sports[family]["n"]),
+            }
+            for family in sorted(sports)
+        },
+        "rest_days": sum(1 for day in week_days if not workouts.get(day) and day not in race_days),
+        "missing_load": int(sum(t["n"] - t["with_load"] for t in all_totals)),
+    }
+
+
+def _week_fitness(wellness: dict[date, WellnessRecord], week_days: list[date]) -> dict[str, Any]:
+    """Projected CTL and ramp at the week's last day and the lowest TSB of its days.
+
+    Ramp is Intervals.icu's ``rampRate``, or CTL(day) - CTL(day - 7) without it.
+    """
+    last = week_days[-1]
+    ctl = _num(wellness.get(last, {}).get("ctl"))
+    ramp = _num(wellness.get(last, {}).get("rampRate"))
+    if ramp is None and ctl is not None:
+        week_ago = _num(wellness.get(last - timedelta(days=7), {}).get("ctl"))
+        ramp = ctl - week_ago if week_ago is not None else None
+    tsb_values = []
+    for day in week_days:
+        record = wellness.get(day, {})
+        day_ctl, day_atl = _num(record.get("ctl")), _num(record.get("atl"))
+        if day_ctl is not None and day_atl is not None:
+            tsb_values.append(day_ctl - day_atl)
+    return {
+        "ctl": _r(ctl, 1),
+        "ramp": _r(ramp, 1),
+        "tsb_min": _r(min(tsb_values), 1) if tsb_values else None,
+    }
+
+
+def plan_summary(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    events: list[CalendarEvent],
+    wellness: dict[date, WellnessRecord],
+    activities: list[Activity],
+    plan_start: date,
+    end: date,
+    race_until: date,
+) -> dict[str, Any]:
+    """Planned workouts per ISO week from ``plan_start`` to ``end``, plus upcoming races.
+
+    * Only events with category WORKOUT count; sport families as in the volume section.
+    * ``load`` is the planned load only: the sum of the loads Intervals.icu computed,
+      None if a week (or sport) has events but none of them has a load.
+      ``missing_load`` counts events without a load.
+    * ``rest_days``: plan days without a WORKOUT event; a race day is no rest day.
+    * ``ctl``/``ramp``/``tsb_min`` come from the Intervals.icu projection in the
+      wellness data, which includes planned workouts (see :func:`_week_fitness`).
+    * The week that also has completed days (it contains ``plan_start - 1``) gets
+      ``done_load`` and ``done_h`` from ``activities``; they are never added to ``load``.
+    * ``races``: RACE_A/B/C events from ``plan_start`` to ``race_until``.
+    """
+    workouts, race_days, races = _collect_plan_events(events, plan_start, end, race_until)
+    weeks: dict[str, list[date]] = {}
+    for offset in range((end - plan_start).days + 1):
+        day = plan_start + timedelta(days=offset)
+        weeks.setdefault(iso_week_label(day), []).append(day)
+
+    done_end = plan_start - timedelta(days=1)
+    rows = []
+    for label, week_days in weeks.items():
+        row = _plan_week(label, week_days, workouts, race_days)
+        row.update(_week_fitness(wellness, week_days))
+        if iso_week_label(done_end) == label:
+            monday = done_end - timedelta(days=done_end.weekday())
+            done = activities_between(activities, monday, done_end)
+            row["done_load"] = _r(sum(activity_load(a) for a in done), 0)
+            row["done_h"] = _r(sum(_num(a.get("moving_time")) or 0.0 for a in done) / 3600, 1)
+        rows.append(row)
+    return {"from": plan_start.isoformat(), "to": end.isoformat(), "weeks": rows, "races": races}
+
+
+def plan_flags(plan: dict[str, Any], config: CoachConfig = DEFAULT_CONFIG) -> list[dict[str, Any]]:
+    """Flags on the planned weeks, each with ``basis`` = projection and its ``week``.
+
+    * ``ramp_planned_high``: projected ramp above ``ramp_planned_warn`` (coach rule).
+    * ``tsb_planned_low``: lowest projected TSB below ``tsb_planned_warn`` /
+      ``tsb_planned_alarm``.
+    * ``planned_rest_days_low``: a week that lies completely in the plan has fewer
+      than ``planned_min_rest_days`` rest days.
+    """
+    flags: list[dict[str, Any]] = []
+    for week in plan["weeks"]:
+        found = []
+        ramp = week["ramp"]
+        if ramp is not None and ramp > config.ramp_planned_warn:
+            found.append(_flag("ramp_planned_high", "warning", ramp, config.ramp_planned_warn))
+        tsb = week["tsb_min"]
+        if tsb is not None and tsb < config.tsb_planned_alarm:
+            found.append(_flag("tsb_planned_low", "alarm", tsb, config.tsb_planned_alarm))
+        elif tsb is not None and tsb < config.tsb_planned_warn:
+            found.append(_flag("tsb_planned_low", "warning", tsb, config.tsb_planned_warn))
+        if week["days"] == 7 and week["rest_days"] < config.planned_min_rest_days:
+            found.append(
+                _flag("planned_rest_days_low", "info", week["rest_days"], config.planned_min_rest_days)
+            )
+        flags.extend({**flag, "basis": "projection", "week": week["week"]} for flag in found)
+    return flags
+
+
+def _with_projection(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    report: dict[str, Any],
+    wellness: dict[date, WellnessRecord],
+    activities: list[Activity],
+    events: list[CalendarEvent],
+    today: date,
+    config: CoachConfig,
+) -> dict[str, Any]:
+    """Projection-mode additions: load.actual/projected, recovery.as_of, plan, flag basis.
+
+    ``plan`` is inserted right after ``volume``; the other keys keep their order.
+    """
+    end = date.fromisoformat(report["period"]["end"])
+    load_end = date.fromisoformat(report["period"]["load_end"])
+    load = report["load"]
+    projected = {
+        "date": load.get("as_of", end.isoformat()),
+        **{key: load[key] for key in ("ctl", "atl", "tsb", "ramp", "src")},
+    }
+    load["actual"] = {"date": today.isoformat(), **fitness_status(wellness, activities, today, today)}
+    load["projected"] = projected
+    report["recovery"] = {"as_of": today.isoformat(), **report["recovery"]}
+
+    race_until = max(end, today + timedelta(days=config.race_lookahead_days))
+    plan = plan_summary(events, wellness, activities, load_end + timedelta(days=1), end, race_until)
+    plan["projection"] = dict(projected)
+
+    flags = [{**flag, "basis": "actual"} for flag in report["flags"]] + plan_flags(plan, config)
+    report["flags"] = sorted(flags, key=lambda flag: _SEVERITY_ORDER[flag["sev"]])
+
+    result: dict[str, Any] = {}
+    for key, value in report.items():
+        result[key] = value
+        if key == "volume":
+            result["plan"] = plan
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -1306,7 +1544,7 @@ def default_load_end(activities: Any, today: date) -> date:
     return today - timedelta(days=1)
 
 
-def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     activities: Any,
     wellness: Any,
     athlete: Any,
@@ -1314,6 +1552,9 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
     days: int,
     config: CoachConfig = DEFAULT_CONFIG,
     load_end: date | None = None,
+    *,
+    today: date | None = None,
+    events: Any = None,
 ) -> dict[str, Any]:
     """Assemble the complete coach report from raw Intervals.icu data.
 
@@ -1323,20 +1564,30 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
         wellness: wellness records (list or date-keyed dict) covering at least
             ``max(days, 60)`` days up to ``end``.
         athlete: the athlete record (for sport settings).
-        end: report date (inclusive). Recovery, CTL/ATL/TSB, eFTP and inactivity
-            flags are evaluated on this day.
+        end: report date (inclusive). CTL/ATL/TSB are evaluated on this day;
+            recovery, eFTP, coverage and inactivity flags too, unless it lies after
+            ``today``.
         days: length of the report window in days.
         config: thresholds and mappings.
         load_end: last day of the load-based windows (volume, ACWR, monotony,
             intensity, durability, EF, top sessions); defaults to ``end`` and is
-            capped at ``end``. See :func:`default_load_end`.
+            capped at ``end`` (at ``today`` in projection mode). See
+            :func:`default_load_end`.
+        today: the athlete's current day. If ``end`` lies after it, the report is a
+            projection (``period.mode``): everything based on completed data is
+            evaluated up to ``today`` / ``load_end``, and ``plan`` summarises
+            ``events`` from ``load_end + 1`` to ``end`` (see :func:`_with_projection`).
+        events: calendar events (planned workouts and races) for projection mode.
 
     Returns:
         A JSON-serialisable dict with fixed keys and ``schema_version``.
     """
     if days < 1:
         raise ValueError("days must be at least 1")
-    load_end = end if load_end is None else min(load_end, end)
+    # Day that recovery and other "current state" values refer to.
+    as_of = today if today is not None and end > today else end
+    projection = as_of != end
+    load_end = as_of if load_end is None else min(load_end, as_of)
     acts = [a for a in activities if isinstance(a, dict)] if isinstance(activities, list) else []
     acts = [a for a in acts if (day := activity_day(a)) is not None and day <= end]
     load_acts = [a for a in acts if (day := activity_day(a)) is not None and day <= load_end]
@@ -1348,6 +1599,7 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "period": {
+            "mode": "projection" if projection else "actual",
             "start": start.isoformat(),
             "end": end.isoformat(),
             "load_end": load_end.isoformat(),
@@ -1359,11 +1611,14 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
             },
         },
         "flags": [],
-        "load": {**fitness_status(well, acts, end), **load_metrics(load_acts, load_end, config)},
+        "load": {
+            **fitness_status(well, acts, end, today),
+            **load_metrics(load_acts, load_end, config),
+        },
         "recovery": {
-            "hrv": hrv_status(well, end, config),
-            "rhr": rhr_status(well, end, config),
-            "sleep": sleep_summary(well, end, days, config),
+            "hrv": hrv_status(well, as_of, config),
+            "rhr": rhr_status(well, as_of, config),
+            "sleep": sleep_summary(well, as_of, days, config),
         },
         "volume": weekly_volume(load_acts, load_end, days, config),
         "intensity": {
@@ -1378,13 +1633,16 @@ def build_coach_report(  # pylint: disable=too-many-arguments,too-many-positiona
         "capability": {
             "durability": durability(load_acts, load_end, days, config),
             "ef": efficiency_factor(load_acts, load_end, config),
-            "eftp": eftp_trend(well, end, config),
+            "eftp": eftp_trend(well, as_of, config),
         },
         "top_sessions": top_sessions(window_acts, config),
         "thresholds": athlete_thresholds(athlete_record, load_acts),
-        "coverage": coverage(window_acts, well, end, days, config),
+        "coverage": coverage(window_acts, well, as_of, days, config),
     }
     report["flags"] = build_flags(
-        report, acts, window_acts, end, max(days, config.chronic_days), config
+        report, acts, window_acts, as_of, max(days, config.chronic_days), config
     )
+    if projection:
+        plan_events = [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+        report = _with_projection(report, well, acts, plan_events, as_of, config)
     return report
