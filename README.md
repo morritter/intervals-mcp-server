@@ -255,9 +255,9 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - `get_activity_streams`: Get raw data streams (power, heart rate, etc.) for a specific activity
 - `get_athlete_power_curves`: Get best power output curves for selected durations and time periods
 - `get_wellness_data`: Fetch wellness data
-- `get_events`: Retrieve upcoming events (workouts, races, etc.)
+- `get_events`: Retrieve upcoming events (workouts, races, etc.) with category, sport, planned load and planned time
 - `get_event_by_id`: Get detailed information for a specific event
-- `add_or_update_event`: Create or update an event (workout, race, note, etc.)
+- `add_or_update_event`: Create or update an event (workout, race, note, etc.); an update only changes the fields you pass
 - `delete_event`: Delete a specific event
 - `delete_events_by_date_range`: Delete events within a date range
 - `get_custom_items`: Get custom items (charts, custom fields, zones, etc.) for an athlete
@@ -278,8 +278,11 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - **Capability**: aerobic decoupling of steady sessions after a quality filter (≥ 60 min, VI ≤ 1.20, moving/elapsed ≥ 0.85, ≤ 25 °C), efficiency factor trend, eFTP trend
 - **Flags**: rule-based hints with severity (for example FTP vs. eFTP deviation, ACWR, monotony, HRV below its normal range, short sleep, missing RPE/feel)
 - **Coverage**: how many days and sessions have HRV, sleep and zone data
+- **Plan** (only for a future `end_date`): planned load, hours and sessions per ISO week and sport family from the calendar, rest days, workouts without a computed load, projected CTL, ramp rate and lowest TSB per week, upcoming races (12 weeks ahead), and flags for a planned ramp above 6 CTL/week, a projected TSB below −20/−30 and planned weeks without a rest day
 
-The athlete ID and API key are read from the environment only. The default end date is today in the athlete's time zone; until the first activity of the day is recorded, the load-based sections end yesterday (`period.load_end`) so a morning report does not count today as a rest day. Recovery and CTL/ATL/TSB always refer to the report date.
+The athlete ID and API key are read from the environment only. The default end date is today in the athlete's time zone; until the first activity of the day is recorded, the load-based sections end yesterday (`period.load_end`) so a morning report does not count today as a rest day. Recovery and CTL/ATL/TSB refer to the report date.
+
+An `end_date` after today (at most 90 days ahead) switches to projection mode (`period.mode = "projection"`, schema 1.1). Everything based on completed training covers the `days` up to the last completed day, and recovery refers to today (`recovery.as_of`), so planned days no longer count as rest days and do not trigger ACWR, deload or HRV false alarms. CTL/ATL/TSB at the end date come from the Intervals.icu projection including planned workouts (`load.src = "api_incl_planned"`); `load.actual` and `load.projected` show both states, and every flag carries `basis: actual` or `basis: projection`. Without a future end date the report is unchanged apart from `schema_version` and `period.mode = "actual"`.
 
 ## Usage with ChatGPT
 
