@@ -75,7 +75,7 @@ def test_get_coach_report_returns_compact_json(monkeypatch):
     params = {url.rsplit("/", 1)[-1]: p for url, p in calls}
     assert params["activities"] == {"oldest": "2026-08-30", "newest": "2026-09-28"}
     assert params["wellness"] == {"oldest": "2026-07-30", "newest": "2026-09-27"}
-    assert all("i1" in url for url, _ in calls)
+    assert all(url == "/athlete/i1" or url.startswith("/athlete/i1/") for url, _ in calls)
 
 
 def test_get_coach_report_short_window_still_fetches_fixed_windows(monkeypatch):
@@ -217,3 +217,32 @@ def test_projection_passes_event_errors_through(monkeypatch):
     _fake_api(monkeypatch, {"events": {"error": True, "message": "boom"}})
     result = asyncio.run(get_coach_report(end_date=WEEK_END.isoformat()))
     assert result == "Error fetching events: boom"
+
+
+def _athlete_ids(calls):
+    return {url.split("/")[2] for url, _ in calls}
+
+
+def test_get_coach_report_uses_given_athlete_id(monkeypatch):
+    monkeypatch.setattr(tool_module.config, "athlete_id", "i1")
+    calls = _fake_api(monkeypatch, _projection_data())
+    report = json.loads(asyncio.run(get_coach_report(end_date=WEEK_END.isoformat(), athlete_id="i2")))
+    assert report["period"]["mode"] == "projection"
+    assert {url.rsplit("/", 1)[-1] for url, _ in calls} == {"i2", "activities", "wellness", "events"}
+    assert _athlete_ids(calls) == {"i2"}
+
+
+def test_get_coach_report_defaults_to_configured_athlete(monkeypatch):
+    monkeypatch.setattr(tool_module.config, "athlete_id", "i1")
+    for athlete_id in (None, "", "  "):
+        calls = _fake_api(monkeypatch)
+        assert asyncio.run(get_coach_report(end_date=END.isoformat(), athlete_id=athlete_id)).startswith("{")
+        assert _athlete_ids(calls) == {"i1"}, athlete_id
+
+
+def test_get_coach_report_rejects_invalid_athlete_id(monkeypatch):
+    calls = _fake_api(monkeypatch)
+    for athlete_id in ("i2/events", "../i1", "abc"):
+        result = asyncio.run(get_coach_report(athlete_id=athlete_id))
+        assert result.startswith("Error: athlete_id must be all digits"), athlete_id
+    assert not calls
