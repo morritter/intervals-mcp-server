@@ -269,7 +269,7 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 
 #### Coach report
 
-`get_coach_report(days=28, end_date=None)` returns a compact JSON report (about 3.3 KB for the default 28 days; each additional week adds roughly 150 bytes) so the LLM interprets numbers instead of calculating them from raw activities. All metrics are computed deterministically in `src/intervals_mcp_server/coach_metrics.py`, a pure module without network access. All thresholds live in its `CoachConfig` dataclass.
+`get_coach_report(days=28, end_date=None, athlete_id=None)` returns a compact JSON report (about 3.3 KB for the default 28 days; each additional week adds roughly 150 bytes) so the LLM interprets numbers instead of calculating them from raw activities. All metrics are computed deterministically in `src/intervals_mcp_server/coach_metrics.py`, a pure module without network access. All thresholds live in its `CoachConfig` dataclass.
 
 - **Volume**: hours, load, sessions and km per ISO week and sport family (Ride and VirtualRide are merged as "Rad"), rest days, hard days, weekly monotony
 - **Load**: CTL, ATL, TSB and ramp rate at the end date, ACWR (7 d / 28 d), Foster monotony and strain, primary-sport monotony for multi-sport athletes, deload detection
@@ -280,7 +280,7 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - **Coverage**: how many days and sessions have HRV, sleep and zone data
 - **Plan** (only for a future `end_date`): planned load, hours and sessions per ISO week and sport family from the calendar, rest days, workouts without a computed load, projected CTL, ramp rate and lowest TSB per week, upcoming races (12 weeks ahead), and flags for a planned ramp above 6 CTL/week, a projected TSB below −20/−30 and planned weeks without a rest day
 
-The athlete ID and API key are read from the environment only. The default end date is today in the athlete's time zone; until the first activity of the day is recorded, the load-based sections end yesterday (`period.load_end`) so a morning report does not count today as a rest day. Recovery and CTL/ATL/TSB refer to the report date.
+The report is for `ATHLETE_ID` by default. As a coach, pass `athlete_id` to get the report of an athlete you coach; profile, time zone and thresholds are then theirs. The API key is read from the environment only. The default end date is today in the athlete's time zone; until the first activity of the day is recorded, the load-based sections end yesterday (`period.load_end`) so a morning report does not count today as a rest day. Recovery and CTL/ATL/TSB refer to the report date.
 
 An `end_date` after today (at most 90 days ahead) switches to projection mode (`period.mode = "projection"`, schema 1.1). Everything based on completed training covers the `days` up to the last completed day, and recovery refers to today (`recovery.as_of`), so planned days no longer count as rest days and do not trigger ACWR, deload or HRV false alarms. CTL/ATL/TSB at the end date come from the Intervals.icu projection including planned workouts (`load.src = "api_incl_planned"`); `load.actual` and `load.projected` show both states, and every flag carries `basis: actual` or `basis: projection`. Without a future end date the report is unchanged apart from `schema_version` and `period.mode = "actual"`.
 

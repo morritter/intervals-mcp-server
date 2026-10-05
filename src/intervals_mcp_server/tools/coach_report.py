@@ -20,6 +20,7 @@ from intervals_mcp_server.coach_metrics import (
     default_load_end,
 )
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
@@ -136,7 +137,9 @@ async def _fetch_report_data(
 
 
 @mcp.tool()
-async def get_coach_report(days: int = 28, end_date: str | None = None) -> str:  # pylint: disable=too-many-return-statements
+async def get_coach_report(  # pylint: disable=too-many-return-statements
+    days: int = 28, end_date: str | None = None, athlete_id: str | None = None
+) -> str:
     """Compact, pre-computed training report (JSON) for coaching questions.
 
     Use this FIRST for overview questions: how training is going, load, fatigue and
@@ -156,6 +159,9 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
             rest day. Recovery and CTL/ATL/TSB refer to the report date. A future
             end_date (at most 90 days ahead) gives a projection to check planned
             weeks, see "Projection mode" below.
+        athlete_id: Intervals.icu athlete ID of a coached athlete (optional; default:
+            ATHLETE_ID from .env, i.e. your own account). Profile, time zone and
+            thresholds are then those of that athlete.
 
     Output keys (schema_version 1.1); null always means "not enough data", never 0:
     - period: mode (actual, or projection when end_date is after today), start,
@@ -215,9 +221,9 @@ async def get_coach_report(days: int = 28, end_date: str | None = None) -> str: 
                 f"{MIN_END_DATE.isoformat()} and {MAX_END_DATE.isoformat()}."
             )
 
-    athlete_id = config.athlete_id
-    if not athlete_id:
-        return "Error: No ATHLETE_ID found in environment variables."
+    athlete_id, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+    if error_msg:
+        return error_msg
 
     # The athlete comes first: "today" (athlete time zone) decides the mode and windows.
     athlete = await make_intervals_request(url=f"/athlete/{athlete_id}")

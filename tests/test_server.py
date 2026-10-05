@@ -914,6 +914,42 @@ def test_get_activity_details_resolves_gear_name(monkeypatch):
     assert "ID: b1" in result
 
 
+def test_get_activity_details_resolves_gear_of_activity_owner(monkeypatch):
+    """
+    Test get_activity_details looks up the gear of the athlete who owns the activity
+    (e.g. a coached athlete), not the configured ATHLETE_ID.
+    """
+    _reset_gear_cache()
+
+    activity = {
+        "name": "Coached Ride",
+        "id": 456,
+        "type": "Ride",
+        "startTime": "2024-01-01T08:00:00Z",
+        "icu_athlete_id": "i2",
+        "gear_id": "b9",
+    }
+    urls: list[str] = []
+
+    async def fake_request(url=None, **_kwargs):
+        urls.append(url)
+        if url and "/gear" in url:
+            return [{"id": "b9", "type": "Bike", "name": "Coached Bike"}]
+        return activity
+
+    monkeypatch.setattr(
+        "intervals_mcp_server.tools.activities.make_intervals_request", fake_request
+    )
+    monkeypatch.setattr(
+        "intervals_mcp_server.tools.gear.make_intervals_request", fake_request
+    )
+    monkeypatch.setattr(gear_module.config, "athlete_id", "i1")
+
+    result = asyncio.run(get_activity_details("456"))
+    assert "Name: Coached Bike" in result
+    assert urls == ["/activity/456", "/athlete/i2/gear"]
+
+
 def test_get_activities_resolves_gear_name(monkeypatch):
     """
     Test get_activities injects resolved gear names for each activity in the list.
